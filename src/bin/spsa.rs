@@ -1185,6 +1185,21 @@ fn run_spsa(
         }
         let score = (batch.plus_wins as f64 + 0.5 * batch.draws as f64) / total as f64;
         let match_result = batch.plus_wins as f64 - batch.minus_wins as f64;
+        // A whitewash with no draws means one side never produced a move (a
+        // crashing config forfeits instantly), not a real gradient. Updating on
+        // it moves every param a full step and corrupts the run.
+        let degenerate = batch.draws == 0 && (batch.plus_wins == 0 || batch.minus_wins == 0);
+        if degenerate {
+            eprintln!(
+                "iter {k:>5} | DISCARDED: {}-{}-{} in {}ms — one side never moved, \
+                 likely a panicking param config. Gradient skipped.",
+                batch.plus_wins,
+                batch.minus_wins,
+                batch.draws,
+                started.elapsed().as_millis()
+            );
+            continue;
+        }
         let next_theta = clamp_theta(
             &update(&theta, &delta, &coeffs, match_result, &selected),
             &selected,
@@ -1287,7 +1302,10 @@ fn main() {
                 tc_fixed_ms: None,
                 tc_max_depth: None,
                 concurrency,
-                variants: variants.split(',').map(Variant::parse).collect(),
+                variants: variants
+                    .split(',')
+                    .map(|s| Variant::parse(s).unwrap_or(Variant::Classical))
+                    .collect(),
                 adjudication_threshold: adjudication,
                 max_moves,
                 search_noise,
@@ -1326,15 +1344,17 @@ fn main() {
             eval_params_json,
         }) => {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Some(json) = search_params_json.as_deref() {
-                    let _ = params::set_search_params_from_json(json);
+                if let Some(json) = search_params_json.as_deref()
+                    && !params::set_search_params_from_json(json)
+                {
+                    eprintln!("search param load rejected: {json}");
                 }
                 if let Some(json) = eval_params_json.as_deref() {
                     let _ = evaluation::set_eval_params_from_json(json);
                 }
                 let mut engine = Engine::from_icn_native(icn.as_str(), None);
                 engine.set_clock(wtime, btime, winc, binc);
-                engine.game_mut().variant = Some(Variant::parse(&variant));
+                engine.game_mut().variant = Variant::parse(&variant);
                 if terminal_reason(engine.game_mut()).is_some() {
                     println!("bestmove none");
                     return;
@@ -1357,6 +1377,8 @@ fn main() {
                 }
             }));
             if result.is_err() {
+                // Otherwise the harness scores a crash as an ordinary loss.
+                eprintln!("search panicked; reporting no move");
                 println!("bestmove none");
             }
         }

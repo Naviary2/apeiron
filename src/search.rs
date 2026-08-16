@@ -963,7 +963,7 @@ pub struct Searcher {
     // Continuation history, keyed by ply offset (1, 2 and 4 plies ago) then capture,
     // check, previous piece and the from/to hashes. The gravity update self-bounds to
     // 16384, so i16 is lossless and the search's hottest table stays at 25MB.
-    pub cont_history: Box<[[[[[[[i16; 16]; 16]; 16]; 32]; 2]; 2]; 3]>,
+    pub cont_history: Box<[[[[[[[i16; 8]; 8]; 8]; 32]; 2]; 2]; 3]>,
 
     // Continuation Correction History: [prev_piece_type][prev_to_hash][cur_piece_type][cur_to_hash]
     // Used for evaluation correction (32*32*32*32*4 = 4MB)
@@ -1114,9 +1114,9 @@ impl Searcher {
             moved_piece_history: vec![0; MAX_PLY],
             cont_history: unsafe {
                 Box::from_raw(Box::into_raw(
-                    vec![0i16; 3 * 2 * 2 * 32 * 16 * 16 * 16].into_boxed_slice(),
+                    vec![0i16; 3 * 2 * 2 * 32 * 8 * 8 * 8].into_boxed_slice(),
                 )
-                    as *mut [[[[[[[i16; 16]; 16]; 16]; 32]; 2]; 2]; 3])
+                    as *mut [[[[[[[i16; 8]; 8]; 8]; 32]; 2]; 2]; 3])
             },
             cont_corrhist: unsafe {
                 Box::from_raw(
@@ -1578,6 +1578,34 @@ impl Searcher {
         let entry = &mut self.pawn_history[ph_idx][pt_idx][to_idx];
         let cur = *entry as i32;
         *entry = (cur + adj - ((cur * adj.abs()) >> 14)) as i16;
+    }
+
+    /// Continuation-history sum over the 1- and 2-ply-back contexts, weighted as
+    /// the move picker weights them so the scales stay comparable.
+    pub fn cont_hist_reduction_score(&self, ply: usize, m: &Move) -> i32 {
+        let cur_from_hash = hash_coord_16(m.from.x, m.from.y);
+        let cur_to_hash = hash_coord_16(m.to.x, m.to.y);
+        const CONT_WEIGHTS: [i32; 2] = [1024, 712];
+        let mut total = 0;
+        for (idx, plies_ago) in [1usize, 2].into_iter().enumerate() {
+            if ply < plies_ago {
+                break;
+            }
+            let Some(prev_move) = self.move_history[ply - plies_ago] else {
+                continue;
+            };
+            let prev_piece = self.moved_piece_history[ply - plies_ago] as usize;
+            if prev_piece >= 32 {
+                continue;
+            }
+            let prev_to_hash = hash_coord_16(prev_move.to.x, prev_move.to.y);
+            let prev_ic = self.in_check_history[ply - plies_ago] as usize;
+            let prev_cap = self.capture_history_stack[ply - plies_ago] as usize;
+            let val = self.cont_history[idx][prev_cap][prev_ic][prev_piece][prev_to_hash]
+                [cur_from_hash][cur_to_hash] as i32;
+            total += (val * CONT_WEIGHTS[idx]) / 1024;
+        }
+        total
     }
 
     /// Update pawn history for moves that caused beta cutoff.
@@ -2256,7 +2284,11 @@ fn search_with_searcher(
     game: &mut GameState,
     max_depth: usize,
 ) -> Option<(Move, i32)> {
-    let moves = game.get_legal_moves();
+    // Root must bypass the slider candidate cache: it is never invalidated, so a
+    // persistent GameState accumulates staleness and the root list both loses legal
+    // moves and gains impossible ones (measured 84% of positions after 120 plies).
+    let mut moves = MoveList::new();
+    game.get_legal_moves_into(&mut moves);
     if moves.is_empty() {
         return None;
     }
@@ -3023,8 +3055,9 @@ pub(crate) fn get_best_moves_multipv_impl(
     #[cfg(feature = "nnue")]
     searcher.nnue_init_root(game);
 
-    // Get all legal moves upfront
-    let moves = game.get_legal_moves();
+    // Get all legal moves upfront (exact: bypasses the stale slider cache)
+    let mut moves = MoveList::new();
+    game.get_legal_moves_into(&mut moves);
     if moves.is_empty() {
         let stats = build_search_stats(searcher);
         return MultiPVResult {
@@ -3471,8 +3504,9 @@ pub fn negamax_node_count_for_depth(game: &mut GameState, depth: usize) -> u64 {
     searcher.decay_history();
     searcher.tt.clear();
 
-    // Generate and filter legal moves
-    let moves = game.get_legal_moves();
+    // Generate and filter legal moves (exact: bypasses the stale slider cache)
+    let mut moves = MoveList::new();
+    game.get_legal_moves_into(&mut moves);
     let mut legal_moves: MoveList = MoveList::new();
     for m in moves {
         let undo = game.make_move(&m);
@@ -4642,6 +4676,22 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
         } else {
             // Late Move Reductions
             let mut reduction: i32 = 0;
+
+            // Captures were exempt from reduction entirely. A late capture whose
+            // capture history is negative is exactly the move to look at cheaply.
+            if depth >= lmr_min_depth()
+                && is_capture
+                && !in_check
+                && !gives_check
+                && !is_royal_capture_win
+                && legal_moves >= lmr_min_moves()
+                && let Some(cap_type) = captured_type
+                && searcher.capture_history[p_type as usize][cap_type as usize] < 0
+                && !see_ge(game, &m, 100)
+            {
+                reduction = 1;
+            }
+
             if depth >= lmr_min_depth()
                 && legal_moves >= lmr_min_moves()
                 && !in_check
@@ -4661,6 +4711,11 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 let hist_score = searcher.history[p_type as usize][hist_idx];
                 let pawn_score = searcher.pawn_hist(ph_idx, p_type as usize, hist_idx);
                 reduction -= (hist_score + pawn_score) / 4096;
+
+                // "Was this good AFTER that move?" — a different signal class
+                // from main history, already trusted for ordering.
+                let cont_score = searcher.cont_hist_reduction_score(ply, &m);
+                reduction -= cont_score / 4096;
 
                 // Correction history adjustment
                 let correction = (static_eval - raw_eval) * CORRHIST_GRAIN;
@@ -4690,8 +4745,10 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     reduction -= 1;
                 }
 
-                // Ensure reduction stays in valid range [0, depth-2]
-                reduction = reduction.clamp(0, (depth as i32) - 2);
+                // Ensure reduction stays in valid range [0, depth-2]. The upper
+                // bound needs flooring: lmr_min_depth of 1 lets depth 1 through,
+                // and clamp panics when min > max.
+                reduction = reduction.clamp(0, ((depth as i32) - 2).max(0));
             }
 
             // Base child depth after LMR (with singular extension if applicable)
@@ -5435,7 +5492,7 @@ fn quiescence(
     }
 
     // Sort captures by MVV-LVA
-    sort_captures(game, &mut tactical_moves);
+    sort_captures(game, searcher, &mut tactical_moves);
 
     // Try the TT move first if it was generated here: it caused a cutoff or was
     // best at this position before, so it is a strong first try. Only hoisted when
