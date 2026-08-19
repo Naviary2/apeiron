@@ -681,13 +681,13 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
     let mut cloud_count: i64 = 0;
     let mut cloud_spread_sum: i64 = 0;
 
+    // Doubled units throughout the cloud: the kings' midpoint lands on a half
+    // square whenever they sit an odd distance apart, and truncating it biases
+    // every distance measured from it by colour.
     let (ref_x, ref_y) = match (white_king, black_king) {
-        (Some(wk), Some(bk)) => (
-            wk.x / 2 + bk.x / 2 + (wk.x % 2 + bk.x % 2) / 2,
-            wk.y / 2 + bk.y / 2 + (wk.y % 2 + bk.y % 2) / 2,
-        ),
-        (Some(wk), None) => (wk.x, wk.y),
-        (None, Some(bk)) => (bk.x, bk.y),
+        (Some(wk), Some(bk)) => (wk.x + bk.x, wk.y + bk.y),
+        (Some(wk), None) => (2 * wk.x, 2 * wk.y),
+        (None, Some(bk)) => (2 * bk.x, 2 * bk.y),
         (None, None) => (0, 0),
     };
 
@@ -980,16 +980,11 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                                 if !is_neutral && pt != PieceType::Pawn {
                                     let cw = get_centrality_weight(pt);
                                     if cw > 0 {
-                                        let dx = x - ref_x;
-                                        let dy = y - ref_y;
-                                        let cdx = dx.clamp(
-                                            -cloud_center_max_skew_dist() as i64,
-                                            cloud_center_max_skew_dist() as i64,
-                                        );
-                                        let cdy = dy.clamp(
-                                            -cloud_center_max_skew_dist() as i64,
-                                            cloud_center_max_skew_dist() as i64,
-                                        );
+                                        let dx = 2 * x - ref_x;
+                                        let dy = 2 * y - ref_y;
+                                        let skew2 = 2 * cloud_center_max_skew_dist() as i64;
+                                        let cdx = dx.clamp(-skew2, skew2);
+                                        let cdy = dy.clamp(-skew2, skew2);
                                         cloud_sum_dx += cw * cdx;
                                         cloud_sum_dy += cw * cdy;
                                         cloud_count += cw;
@@ -1436,6 +1431,9 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
 
                         // Post-Pass processing
                         let final_phase = effective_phase(phase, game.initial_phase);
+                        // Doubled units: the centroid of a symmetric position lands on a
+                        // half square, and truncating it to an integer moves the centre
+                        // toward one side, biasing every cloud distance by colour.
                         let cloud_center = if cloud_count > 0 {
                             Some(Coordinate {
                                 x: ref_x + cloud_sum_dx / cloud_count,
@@ -1447,7 +1445,7 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                         // Weighted average Chebyshev distance of pieces from the kings' midpoint.
                         // Low = tight/closed position (leapers thrive), High = spread/open (sliders dominate).
                         let cloud_avg_spread = if cloud_count > 0 {
-                            (cloud_spread_sum / cloud_count) as i32
+                            (cloud_spread_sum / cloud_count / 2) as i32
                         } else {
                             8 // neutral fallback
                         };
@@ -1926,8 +1924,8 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
         let piece_val = get_piece_value_base(pt);
 
         if let Some(center) = &cloud_center {
-            let dx = (x - center.x).abs();
-            let dy = (y - center.y).abs();
+            let dx = (2 * x - center.x).abs() / 2;
+            let dy = (2 * y - center.y).abs() / 2;
             let cheb = dx.max(dy);
 
             if pt != PieceType::Pawn && !pt.is_royal() && cheb > piece_cloud_cheb_radius() as i64 {
@@ -1947,8 +1945,8 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
                         lane_dist = lane_dist.min(dx.min(dy));
                     }
                     if is_diag || is_queen {
-                        let d1 = ((x - y) - (center.x - center.y)).abs();
-                        let d2 = ((x + y) - (center.x + center.y)).abs();
+                        let d1 = (2 * (x - y) - (center.x - center.y)).abs() / 2;
+                        let d2 = (2 * (x + y) - (center.x + center.y)).abs() / 2;
                         lane_dist = lane_dist.min(d1.min(d2));
                     }
 
@@ -2613,8 +2611,15 @@ pub fn evaluate_bishop(
         _ => 100,
     };
 
-    // Long diagonal control bonus: bishops near "main" diagonals get a small bonus.
-    if (x - y).abs() <= 1 || (x + y - 8).abs() <= 1 {
+    // Long diagonal control bonus. A diagonal at a fixed absolute position means
+    // nothing on an unbounded board and is not colour-symmetric, so anchor both to
+    // the kings' midpoint. Doubled units keep a half-square midpoint exact.
+    let (rx2, ry2) = match (white_royals.first(), black_royals.first()) {
+        (Some(wk), Some(bk)) => (wk.x + bk.x, wk.y + bk.y),
+        (Some(k), None) | (None, Some(k)) => (2 * k.x, 2 * k.y),
+        (None, None) => (0, 0),
+    };
+    if (2 * (x - y) - (rx2 - ry2)).abs() <= 2 || (2 * (x + y) - (rx2 + ry2)).abs() <= 2 {
         bonus += 8;
     }
 
@@ -2730,7 +2735,7 @@ fn evaluate_leaper_positioning(
     // 1. CLOUD PROXIMITY: reward being near the piece cloud center
     let scale = (piece_value / leaper_tropism_divisor()).max(1);
     if let Some(center) = cloud_center {
-        let dist = (x - center.x).abs().max((y - center.y).abs());
+        let dist = (2 * x - center.x).abs().max((2 * y - center.y).abs()) / 2;
         if dist <= 10 {
             bonus += (11 - dist as i32) * (scale / 3).max(1);
         }
@@ -3984,6 +3989,76 @@ mod tests {
     use super::*;
 
     use crate::game::GameState;
+
+    /// A colour mirror must evaluate to exactly 0. Any gap means a term reads an
+    /// absolute board position rather than one derived from the pieces -- an 8x8
+    /// assumption that also fires arbitrarily once play drifts from the origin.
+    #[test]
+    fn mirror_symmetric_positions_evaluate_to_zero() {
+        use crate::board::PlayerColor;
+        use std::collections::BTreeMap;
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
+        // One variant at a time: setup_position_from_icn writes global world bounds.
+        let variants = [
+            crate::Variant::Classical,
+            crate::Variant::CoaIP,
+            crate::Variant::CoaIPHO,
+            crate::Variant::CoaIPRO,
+            crate::Variant::CoaIPNO,
+            crate::Variant::Palace,
+            crate::Variant::Standarch,
+            crate::Variant::Obstocean,
+            crate::Variant::Knightline,
+            crate::Variant::Core,
+            crate::Variant::ConfinedClassical,
+            crate::Variant::Chess,
+            crate::Variant::ScatteredLeapers,
+            crate::Variant::ClassicalPlus,
+            crate::Variant::DoubleKingClassical,
+        ];
+        for v in variants {
+            let mut game = GameState::new();
+            game.setup_position_from_icn(v.starting_icn());
+
+            let mut white: BTreeMap<(i64, i64), u8> = BTreeMap::new();
+            let mut black: BTreeMap<(i64, i64), u8> = BTreeMap::new();
+            for (x, y, p) in game.board.iter_all_pieces() {
+                match p.color() {
+                    PlayerColor::White => white.insert((x, y), p.piece_type() as u8),
+                    PlayerColor::Black => black.insert((x, y), p.piece_type() as u8),
+                    PlayerColor::Neutral => continue,
+                };
+            }
+            if white.len() != black.len() || white.is_empty() {
+                continue;
+            }
+            let (Some(wmin), Some(bmax)) = (
+                white.keys().map(|k| k.1).min(),
+                black.keys().map(|k| k.1).max(),
+            ) else {
+                continue;
+            };
+            let axis = wmin + bmax;
+            if white
+                .iter()
+                .any(|((x, y), pt)| black.get(&(*x, axis - *y)) != Some(pt))
+            {
+                continue; // not a mirror; an imbalance here is legitimate
+            }
+
+            checked += 1;
+            let score = evaluate_inner(&game);
+            if score != 0 {
+                offenders.push(format!("{v:?} evaluates {score} in a colour mirror"));
+            }
+        }
+
+        assert!(checked >= 10, "expected several mirror variants, saw {checked}");
+        assert!(offenders.is_empty(), "{}", offenders.join("; "));
+    }
 
     /// The trace must be an accounting identity: summing the rows has to
     /// reproduce the base evaluation exactly, or every CP tuned against it is
