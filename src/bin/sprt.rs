@@ -87,6 +87,15 @@ enum Commands {
         )]
         variants: String,
 
+        /// Play a one-off custom position instead of the variants' own openings.
+        /// Bounds come from the ICN if it carries them.
+        #[arg(long)]
+        icn: Option<String>,
+
+        /// Label for --icn in the per-variant breakdown.
+        #[arg(long, default_value = "Custom")]
+        icn_name: String,
+
         /// Material threshold for draws (both engines must agree for 3 consecutive plies)
         #[arg(long, default_value_t = 0)]
         adjudication: i32,
@@ -141,7 +150,7 @@ enum Commands {
         resume: Option<String>,
 
         /// Save the --games file every N completed games when --games is set (0 = every game)
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 10)]
         save_interval: usize,
     },
 
@@ -440,6 +449,8 @@ struct Config {
     max_games: Option<usize>,
     min_games: usize,
     variants: Vec<Variant>,
+    custom_icn: Option<String>,
+    custom_label: String,
     adjudication_threshold: i32,
     maxply_adjudication: f64,
     new_bin: String,
@@ -538,8 +549,8 @@ impl PentaCounts {
         (self.ww as f64
             + 0.75 * self.wd as f64
             + 0.5 * (self.wl as f64 + self.dd as f64)
-            + 0.25 * self.ld as f64
-        ) / self.total_pairs() as f64
+            + 0.25 * self.ld as f64)
+            / self.total_pairs() as f64
     }
 
     fn variance(&self) -> f64 {
@@ -548,8 +559,8 @@ impl PentaCounts {
             + self.wd as f64 * (0.75 - score).powi(2)
             + (self.wl as f64 + self.dd as f64) * (0.5 - score).powi(2)
             + self.ld as f64 * (0.25 - score).powi(2)
-            + self.ll as f64 * (0.0 - score).powi(2)
-        ) / self.total_pairs() as f64
+            + self.ll as f64 * (0.0 - score).powi(2))
+            / self.total_pairs() as f64
     }
 
     /// Bucket a completed pair from the two NEW-perspective game results.
@@ -1055,7 +1066,7 @@ fn parse_bestmove_to_icn(bestmove_str: &str, turn: PlayerColor) -> Option<String
 }
 
 fn has_any_fully_legal_move(game: &GameState) -> bool {
-    let moves = game.get_legal_moves();
+    let moves = game.get_pseudo_legal_moves();
     for m in moves {
         let mut game_copy = game.clone();
         game_copy.make_move(&m);
@@ -1275,6 +1286,17 @@ fn with_variant_bounds<T>(variant: Variant, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+impl Config {
+    /// A custom position has no variant of its own, so it borrows one for bounds
+    /// and reports under its own label instead.
+    fn variant_label(&self, v: Variant) -> String {
+        match &self.custom_icn {
+            Some(_) => self.custom_label.clone(),
+            None => v.to_str().to_string(),
+        }
+    }
+}
+
 fn play_game(
     config: &Config,
     variant: Variant,
@@ -1284,8 +1306,18 @@ fn play_game(
 ) -> GameOutcome {
     let mut game = with_variant_bounds(variant, || {
         let mut game = GameState::new();
-        game.setup_position_from_icn(variant.starting_icn());
-        game.variant = Some(variant);
+        match &config.custom_icn {
+            // Left untagged so the generic evaluator runs: a custom position is
+            // not the variant whose bounds it borrowed.
+            Some(icn) => {
+                game.setup_position_from_icn(icn);
+                game.variant = None;
+            }
+            None => {
+                game.setup_position_from_icn(variant.starting_icn());
+                game.variant = Some(variant);
+            }
+        }
         game
     });
 
@@ -1335,13 +1367,22 @@ fn play_game(
                     $result_str,
                     &starting_board_setup,
                 ),
-                variant_name: variant.to_str().to_string(),
+                variant_name: config.variant_label(variant),
                 game_idx,
                 termination_reason: $reason.to_string(),
                 new_engine_timed_out: false,
             }
         };
     }
+
+    let interrupted = || GameOutcome {
+        result: GameResult::Draw,
+        icn: String::new(),
+        variant_name: config.variant_label(variant),
+        game_idx,
+        termination_reason: "interrupted".to_string(),
+        new_engine_timed_out: false,
+    };
 
     // Record initial position
     {
@@ -1352,14 +1393,7 @@ fn play_game(
     for (ply, &seed_val) in seeds.iter().enumerate().take(config.max_moves) {
         if STOP.load(Ordering::SeqCst) {
             if USER_STOP.load(Ordering::SeqCst) {
-                return GameOutcome {
-                    result: GameResult::Draw, // Dummy result
-                    icn: String::new(),
-                    variant_name: variant.to_str().to_string(),
-                    game_idx,
-                    termination_reason: "interrupted".to_string(),
-                    new_engine_timed_out: false,
-                };
+                return interrupted();
             }
             break;
         }
@@ -1517,13 +1551,18 @@ fn play_game(
             if slot.is_none() {
                 match ServeEngine::spawn(bin, config.verbose) {
                     Ok(e) => *slot = Some(e),
-                    Err(e) => abort_run(AbortReason::EngineFault {
-                        kind: "engine failed to start",
-                        engine: if is_new_turn { "NEW" } else { "OLD" },
-                        game_idx,
-                        variant: variant.to_str().to_string(),
-                        detail: format!("could not spawn {bin} in serve mode: {e}"),
-                    }),
+                    Err(e) => {
+                        if USER_STOP.load(Ordering::SeqCst) {
+                            return interrupted();
+                        }
+                        abort_run(AbortReason::EngineFault {
+                            kind: "engine failed to start",
+                            engine: if is_new_turn { "NEW" } else { "OLD" },
+                            game_idx,
+                            variant: variant.to_str().to_string(),
+                            detail: format!("could not spawn {bin} in serve mode: {e}"),
+                        });
+                    }
                 }
             }
             let engine = slot.as_mut().expect("engine spawned above");
@@ -1642,6 +1681,12 @@ fn play_game(
             )
         };
 
+        // Ctrl+C can also terminate a child sharing this console. Its closed
+        // pipe is a cancellation, never an engine failure.
+        if USER_STOP.load(Ordering::SeqCst) {
+            return interrupted();
+        }
+
         // A crashed engine invalidates every remaining game, so stop the run.
         // Once STOP is set the run is already winding down and in-flight engines
         // are being torn down, so a fault there is expected noise.
@@ -1693,7 +1738,7 @@ fn play_game(
                     result_str,
                     &starting_board_setup,
                 ),
-                variant_name: variant.to_str().to_string(),
+                variant_name: config.variant_label(variant),
                 game_idx,
                 termination_reason: "timeout".to_string(),
                 new_engine_timed_out: is_new_turn,
@@ -1848,14 +1893,7 @@ fn play_game(
             }
 
             if USER_STOP.load(Ordering::SeqCst) {
-                return GameOutcome {
-                    result: GameResult::Draw, // Dummy result
-                    icn: String::new(),
-                    variant_name: variant.to_str().to_string(),
-                    game_idx,
-                    termination_reason: "interrupted".to_string(),
-                    new_engine_timed_out: false,
-                };
+                return interrupted();
             }
 
             termination_reason = Some("engine failure");
@@ -1886,7 +1924,7 @@ fn play_game(
                     if white_won { "1-0" } else { "0-1" },
                     &starting_board_setup,
                 ),
-                variant_name: variant.to_str().to_string(),
+                variant_name: config.variant_label(variant),
                 game_idx,
                 termination_reason: termination_reason.unwrap_or("engine failure").to_string(),
                 new_engine_timed_out: false,
@@ -2181,6 +2219,9 @@ static LIVE_VIEW_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Record the first fatal cause and signal every worker to wind down.
 fn abort_run(reason: AbortReason) {
+    if USER_STOP.load(Ordering::SeqCst) {
+        return;
+    }
     let _ = ABORT.set(reason);
     STOP.store(true, Ordering::SeqCst);
 }
@@ -2241,7 +2282,13 @@ impl Colors {
                 reset: "\x1b[0m",
             }
         } else {
-            Self { green: "", red: "", yellow: "", gray: "", reset: "" }
+            Self {
+                green: "",
+                red: "",
+                yellow: "",
+                gray: "",
+                reset: "",
+            }
         }
     }
 
@@ -2322,7 +2369,9 @@ struct SprtStats {
     lower: f64,
     upper: f64,
     max_games: Option<usize>,
-    /// Trailing (games played, LLR) samples, used to fit the ETA's trend line.
+    min_games: usize,
+    /// Trailing (games played, LLR) samples used to estimate the LLR process's
+    /// drift and diffusion for the ETA.
     llr_history: VecDeque<(f64, f64)>,
     /// The ETA is smoothed frame-to-frame (see [`Self::update_eta`]), so it is
     /// stored rather than recomputed fresh — a raw per-update estimate swings
@@ -2385,76 +2434,132 @@ impl SprtStats {
         let played = self.total_games().saturating_sub(self.resumed_games) as f64;
         let llr = self.llr();
         self.llr_history.push_back((played, llr));
-        const HISTORY_CAP: usize = 60;
+        const HISTORY_CAP: usize = 240;
         if self.llr_history.len() > HISTORY_CAP {
             self.llr_history.pop_front();
         }
 
         let fresh = self.fresh_eta(played, llr);
         self.smoothed_eta = match (self.smoothed_eta, fresh) {
-            // Blend in seconds so the displayed number drifts smoothly instead
-            // of jumping to whatever the latest noisy sample says.
             (Some(prev), Some(new)) => {
-                const SMOOTHING: f64 = 0.15; // weight given to the new estimate
-                Some(Duration::from_secs_f64(
-                    prev.as_secs_f64() * (1.0 - SMOOTHING) + new.as_secs_f64() * SMOOTHING,
-                ))
+                const SMOOTHING: f64 = 0.12;
+                let blended = if prev.is_zero() || new.is_zero() {
+                    new
+                } else {
+                    // Geometric smoothing makes even an order-of-magnitude
+                    // revision arrive gradually instead of dominating one frame.
+                    Duration::from_secs_f64(
+                        (prev.as_secs_f64().ln() * (1.0 - SMOOTHING)
+                            + new.as_secs_f64().ln() * SMOOTHING)
+                            .exp(),
+                    )
+                };
+                let bounded = self.cap_eta().map_or(blended, |cap| blended.min(cap));
+                Some(
+                    self.min_games_eta()
+                        .map_or(bounded, |floor| bounded.max(floor)),
+                )
             }
-            // No prior estimate to blend with, or the trend just vanished
-            // (flat/reversed) — show the fresh read (possibly None) directly.
             (_, fresh) => fresh,
         };
     }
 
-    /// One fresh ETA estimate, before smoothing. Prefers the hard `--max-games`
-    /// cap; otherwise fits a trend line through recent (games, LLR) samples and
-    /// projects it to whichever bound it's actually heading for. A regression
-    /// over a window is far steadier than extrapolating from a single current
-    /// LLR value, which swings wildly — and can divide by near-zero — early in
-    /// a run. Returns None rather than a number when the trend gives no honest
-    /// answer: too little history, a flat slope, or heading away from both bounds.
+    fn cap_eta(&self) -> Option<Duration> {
+        let max = self.max_games?;
+        let rate = self.games_per_min();
+        (rate > 0.0).then(|| {
+            let remaining = max.saturating_sub(self.total_games()) as f64;
+            Duration::from_secs_f64((remaining / rate * 60.0).min(u32::MAX as f64))
+        })
+    }
+
+    fn min_games_eta(&self) -> Option<Duration> {
+        let rate = self.games_per_min();
+        (rate > 0.0).then(|| {
+            let remaining = self.min_games.saturating_sub(self.total_games()) as f64;
+            Duration::from_secs_f64((remaining / rate * 60.0).min(u32::MAX as f64))
+        })
+    }
+
+    /// Estimates first passage to either SPRT bound. The hard game cap, when
+    /// present, remains the ceiling; statistical evidence can only shorten it.
     fn fresh_eta(&self, played: f64, llr: f64) -> Option<Duration> {
         let rate = self.games_per_min();
         if rate <= 0.0 {
             return None;
         }
-        if let Some(max) = self.max_games {
-            let remaining = max.saturating_sub(self.total_games()) as f64;
-            return Some(Duration::from_secs_f64((remaining / rate * 60.0).min(u32::MAX as f64)));
+        let cap = self.cap_eta();
+        let floor = self.min_games_eta();
+
+        const MIN_INTERVALS: usize = 30;
+        if self.llr_history.len() <= MIN_INTERVALS || played < 60.0 {
+            return cap.or(floor);
         }
 
-        const MIN_SAMPLES: usize = 10;
-        if self.llr_history.len() < MIN_SAMPLES || played < 20.0 {
-            return None;
+        let increments: Vec<(f64, f64)> = self
+            .llr_history
+            .iter()
+            .zip(self.llr_history.iter().skip(1))
+            .filter_map(|(&(x0, y0), &(x1, y1))| (x1 > x0).then_some((x1 - x0, y1 - y0)))
+            .collect();
+        if increments.len() < MIN_INTERVALS {
+            return cap.or(floor);
         }
 
-        // Least-squares slope of LLR against games played.
-        let n = self.llr_history.len() as f64;
-        let mean_x = self.llr_history.iter().map(|(x, _)| x).sum::<f64>() / n;
-        let mean_y = self.llr_history.iter().map(|(_, y)| y).sum::<f64>() / n;
-        let (mut cov, mut var_x) = (0.0, 0.0);
-        for &(x, y) in &self.llr_history {
-            cov += (x - mean_x) * (y - mean_y);
-            var_x += (x - mean_x).powi(2);
-        }
-        if var_x <= 0.0 {
-            return None;
-        }
-        let slope = cov / var_x; // LLR gained per game, at the recent trend
-        if slope.abs() < 1e-6 {
-            return None; // flat trend: no meaningful ETA
+        let observed_games = increments.iter().map(|(dx, _)| dx).sum::<f64>();
+        let raw_drift = increments.iter().map(|(_, dy)| dy).sum::<f64>() / observed_games;
+        let variance = increments
+            .iter()
+            .map(|(dx, dy)| (dy - raw_drift * dx).powi(2) / dx)
+            .sum::<f64>()
+            / increments.len() as f64;
+        if !variance.is_finite() || variance <= 1e-12 {
+            return cap.or(floor);
         }
 
-        let target = if slope > 0.0 { self.upper } else { self.lower };
-        let remaining_llr = target - llr;
-        // Matching signs means the trend is actually closing on that bound;
-        // opposite signs mean it has turned away from it.
-        if remaining_llr.signum() != slope.signum() {
-            return None;
-        }
-        let remaining_games = (remaining_llr / slope).max(0.0);
-        Some(Duration::from_secs_f64((remaining_games / rate * 60.0).min(u32::MAX as f64)))
+        // A noisy short-run slope is the source of ETA whiplash. Only the
+        // statistically supported part of drift survives; variance never does.
+        let drift_se = (variance / observed_games).sqrt();
+        let drift = if raw_drift.abs() <= 1.5 * drift_se {
+            0.0
+        } else {
+            raw_drift.signum() * (raw_drift.abs() - 1.5 * drift_se)
+        };
+        let remaining_games =
+            expected_first_exit_games(llr, self.lower, self.upper, drift, variance)?;
+        let statistical =
+            Duration::from_secs_f64((remaining_games / rate * 60.0).min(u32::MAX as f64));
+        let estimate = cap.map_or(statistical, |hard_cap| statistical.min(hard_cap));
+        Some(floor.map_or(estimate, |minimum| estimate.max(minimum)))
     }
+}
+
+/// Mean first-exit time for a Brownian random walk with two absorbing bounds.
+/// Its zero-drift limit stays finite, so normal LLR reversals remain informative.
+fn expected_first_exit_games(
+    llr: f64,
+    lower: f64,
+    upper: f64,
+    drift_per_game: f64,
+    variance_per_game: f64,
+) -> Option<f64> {
+    if !(lower < upper && variance_per_game > 0.0) {
+        return None;
+    }
+    let width = upper - lower;
+    let mut position = llr.clamp(lower, upper) - lower;
+    let mut drift = drift_per_game;
+    if drift < 0.0 {
+        position = width - position;
+        drift = -drift;
+    }
+    if drift * width / variance_per_game < 1e-4 {
+        return Some((position * (width - position) / variance_per_game).max(0.0));
+    }
+
+    let k = 2.0 * drift / variance_per_game;
+    let ratio = (-k * position).exp_m1() / (-k * width).exp_m1();
+    Some(((width * ratio - position) / drift).max(0.0))
 }
 
 fn fmt_duration(d: Duration) -> String {
@@ -2563,7 +2668,11 @@ fn compact_status_line(stats: &SprtStats, colors: &Colors, max_width: Option<usi
     let color = colors.by_elo(pe.elo);
     // The only ANSI bytes in this line, so the overhead is exactly this much —
     // no need for a general-purpose escape-code scanner.
-    let color_overhead = if colors.reset.is_empty() { 0 } else { color.len() + colors.reset.len() };
+    let color_overhead = if colors.reset.is_empty() {
+        0
+    } else {
+        color.len() + colors.reset.len()
+    };
 
     let core = format!(
         "Games: {} ({} pairs) | W: {} L: {} D: {} | Elo: {color}{:.2}{} +/- {:.2}",
@@ -2626,9 +2735,16 @@ impl FullView {
         let (variant_rows, height) = Self::layout_for(variant_count);
         let terminal = ratatui::Terminal::with_options(
             ratatui::backend::CrosstermBackend::new(std::io::stdout()),
-            ratatui::TerminalOptions { viewport: ratatui::Viewport::Inline(height) },
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(height),
+            },
         )?;
-        Ok(Self { terminal, variant_count, variant_rows, colors })
+        Ok(Self {
+            terminal,
+            variant_count,
+            variant_rows,
+            colors,
+        })
     }
 
     /// Ratatui's inline viewport height is fixed at construction: `Terminal::resize`
@@ -2652,7 +2768,9 @@ impl FullView {
         let _ = std::io::stdout().flush();
         if let Ok(new_terminal) = ratatui::Terminal::with_options(
             ratatui::backend::CrosstermBackend::new(std::io::stdout()),
-            ratatui::TerminalOptions { viewport: ratatui::Viewport::Inline(height) },
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(height),
+            },
         ) {
             self.terminal = new_terminal;
             self.variant_rows = variant_rows;
@@ -2729,9 +2847,10 @@ impl FullView {
                     total,
                     stats.penta.total_pairs(),
                     stats.games_per_min(),
-                    stats
-                        .eta()
-                        .map_or_else(String::new, |eta| format!("  ·  eta ~{}", fmt_duration(eta))),
+                    stats.eta().map_or_else(String::new, |eta| format!(
+                        "  ·  eta ~{}",
+                        fmt_duration(eta)
+                    )),
                 )),
             ]),
             rule.clone(),
@@ -2778,7 +2897,12 @@ impl FullView {
         let variants: Vec<_> = stats
             .variant_order
             .iter()
-            .map(|name| (name, stats.per_variant.get(name).copied().unwrap_or_default()))
+            .map(|name| {
+                (
+                    name,
+                    stats.per_variant.get(name).copied().unwrap_or_default(),
+                )
+            })
             .collect();
         for (name, (w, l, d)) in variants.iter().take(self.variant_rows) {
             let (velo, verr) = estimate_elo(*w, *l, *d);
@@ -2821,16 +2945,30 @@ impl FullView {
 /// Report a fatal cause loudly, with enough context to reproduce it, and make
 /// clear the partial numbers are not a result.
 fn print_abort_report(reason: &AbortReason, stats: &SprtStats, colors: &Colors) {
-    let Colors { red, yellow, reset, .. } = *colors;
+    let Colors {
+        red, yellow, reset, ..
+    } = *colors;
     eprintln!("\n{red}════════════════════════ SPRT ABORTED ════════════════════════{reset}");
     match reason {
-        AbortReason::Panic { message, location, backtrace } => {
-            eprintln!("{red}The harness panicked. This is a bug in sprt.rs, not in the engine.{reset}");
+        AbortReason::Panic {
+            message,
+            location,
+            backtrace,
+        } => {
+            eprintln!(
+                "{red}The harness panicked. This is a bug in sprt.rs, not in the engine.{reset}"
+            );
             eprintln!("\n  panic: {message}");
             eprintln!("  at:    {location}");
             eprintln!("\nbacktrace:\n{backtrace}");
         }
-        AbortReason::EngineFault { kind, engine, game_idx, variant, detail } => {
+        AbortReason::EngineFault {
+            kind,
+            engine,
+            game_idx,
+            variant,
+            detail,
+        } => {
             eprintln!("{red}The {engine} engine hit a fault: {kind}{reset}");
             eprintln!("\n  game:    {game_idx}");
             eprintln!("  variant: {variant}");
@@ -2859,7 +2997,10 @@ fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         text.to_string()
     } else {
-        text.chars().take(max.saturating_sub(1)).chain(['…']).collect()
+        text.chars()
+            .take(max.saturating_sub(1))
+            .chain(['…'])
+            .collect()
     }
 }
 
@@ -2896,6 +3037,8 @@ fn main() {
             max_games,
             min_games,
             variants,
+            icn,
+            icn_name,
             adjudication,
             maxply_adjudication,
             games,
@@ -3153,7 +3296,14 @@ fn main() {
                 concurrency,
                 max_games,
                 min_games,
-                variants: parsed_variants,
+                variants: match &icn {
+                    // One carrier variant: the position supplies itself, and any
+                    // bounds token in the ICN overrides the borrowed default.
+                    Some(_) => vec![Variant::Classical],
+                    None => parsed_variants,
+                },
+                custom_icn: icn.clone(),
+                custom_label: icn_name.clone(),
                 adjudication_threshold: adjudication,
                 maxply_adjudication,
                 use_serve: {
@@ -3263,7 +3413,10 @@ fn main() {
                 losses: 0,
                 draws: 0,
                 penta: PentaCounts::default(),
-                per_variant: variant_order.iter().map(|name| (name.clone(), (0, 0, 0))).collect(),
+                per_variant: variant_order
+                    .iter()
+                    .map(|name| (name.clone(), (0, 0, 0)))
+                    .collect(),
                 variant_order,
                 timeout_losses: 0,
                 new_engine_timeouts: 0,
@@ -3275,6 +3428,7 @@ fn main() {
                 lower,
                 upper,
                 max_games: config.max_games,
+                min_games: config.min_games,
                 llr_history: VecDeque::new(),
                 smoothed_eta: None,
             };
@@ -3296,9 +3450,16 @@ fn main() {
 
             // No color when stdout isn't a terminal (piped/redirected) or NO_COLOR is
             // set (https://no-color.org), so raw escape codes never leak as garbage text.
-            let use_color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+            let use_color =
+                std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
             let colors = Colors::new(use_color);
-            let Colors { green, red, yellow, reset, .. } = colors;
+            let Colors {
+                green,
+                red,
+                yellow,
+                reset,
+                ..
+            } = colors;
             let output_mode = OutputMode::detect(config.compact);
 
             println!("\nStarting SPRT with Configuration:");
@@ -3503,7 +3664,9 @@ fn main() {
             // Surface a worker panic that the channel closing would otherwise hide.
             let producer_panicked = producer.join().is_err();
 
-            if let Some(reason) = ABORT.get() {
+            if !USER_STOP.load(Ordering::SeqCst)
+                && let Some(reason) = ABORT.get()
+            {
                 // Persist whatever was played, so an abort doesn't cost the games.
                 if let Some(ref path) = games_path {
                     save_games_file(path, &game_logs);
@@ -3511,7 +3674,7 @@ fn main() {
                 print_abort_report(reason, &stats, &colors);
                 std::process::exit(1);
             }
-            if producer_panicked {
+            if producer_panicked && !USER_STOP.load(Ordering::SeqCst) {
                 eprintln!(
                     "{red}SPRT ABORTED: a worker thread panicked but no cause was recorded.{reset}"
                 );
@@ -3539,8 +3702,14 @@ fn main() {
             };
 
             let text_color = colors.by_elo(pe.elo);
-            println!("  Elo: {text_color}{:.2}{reset} +/- {:.2}", pe.elo, pe.elo_err);
-            println!("  nElo: {text_color}{:.2}{reset} +/- {:.2}", pe.nelo, pe.nelo_err);
+            println!(
+                "  Elo: {text_color}{:.2}{reset} +/- {:.2}",
+                pe.elo, pe.elo_err
+            );
+            println!(
+                "  nElo: {text_color}{:.2}{reset} +/- {:.2}",
+                pe.nelo, pe.nelo_err
+            );
 
             println!(
                 "  Games: {} | W: {} L: {} D: {}",
@@ -3587,7 +3756,8 @@ fn main() {
 
             if let Some(path) = games_path {
                 if let Some(parent) = std::path::Path::new(&path).parent() {
-                    std::fs::create_dir_all(parent).expect("Failed to create games output directory");
+                    std::fs::create_dir_all(parent)
+                        .expect("Failed to create games output directory");
                 }
                 let json_data = serde_json::to_string_pretty(&game_logs).unwrap();
                 std::fs::write(path, json_data).expect("Failed to write JSON output");
@@ -3698,7 +3868,8 @@ fn main() {
                     per_variant: stats.per_variant,
                 };
                 if let Some(parent) = std::path::Path::new(&path).parent() {
-                    std::fs::create_dir_all(parent).expect("Failed to create results output directory");
+                    std::fs::create_dir_all(parent)
+                        .expect("Failed to create results output directory");
                 }
                 let json_data = serde_json::to_string_pretty(&res).unwrap();
                 std::fs::write(path, json_data).expect("Failed to write results output");
@@ -3958,6 +4129,23 @@ mod pentanomial_tests {
         p.add_pair(GameResult::Loss, GameResult::Loss);
         assert_eq!((p.ww, p.wd, p.wl, p.dd, p.ld, p.ll), (1, 1, 1, 1, 1, 1));
         assert_eq!(p.total_pairs(), 6);
+    }
+
+    #[test]
+    fn eta_first_exit_handles_zero_drift() {
+        let games = expected_first_exit_games(0.0, -3.0, 3.0, 0.0, 0.25).unwrap();
+        assert!((games - 36.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn eta_first_exit_respects_direction_and_bounds() {
+        let toward = expected_first_exit_games(2.0, -3.0, 3.0, 0.05, 0.02).unwrap();
+        let away = expected_first_exit_games(2.0, -3.0, 3.0, -0.05, 0.02).unwrap();
+        assert!(toward < away);
+        assert_eq!(
+            expected_first_exit_games(3.0, -3.0, 3.0, 0.0, 0.25),
+            Some(0.0)
+        );
     }
 
     #[test]

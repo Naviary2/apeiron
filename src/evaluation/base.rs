@@ -4,22 +4,26 @@ use crate::game::{GameState, WinCondition};
 use smallvec::SmallVec;
 use std::cell::{Cell, UnsafeCell};
 
+use super::piece_reach::{
+    evaluate_compound_leap_threats, evaluate_huygen_reach, evaluate_knightrider_reach,
+    evaluate_rose_reach,
+};
 use crate::search::params::{
-    amazon_compound_bonus, amazon_queen_scale, amazon_rook_scale, archbishop,
+    amazon, amazon_queen_scale, amazon_rook_scale, archbishop,
     archbishop_bishop_scale, bishop, camel, candidate_passer_bonus, centaur, centaur_guard_scale,
-    chancellor_bonus, chancellor_rook_scale, cloud_center_max_skew_dist,
-    cloud_penalty_per_100_value, complexity_damp, complexity_excess_max, eg_bishop_pair_bonus,
+    chancellor, chancellor_rook_scale, cloud_center_max_skew_dist,
+    centrality_value_scale, cloud_penalty_max_pct, cloud_penalty_per_100_value, complexity_damp, complexity_excess_max, eg_bishop_pair_bonus,
     eg_doubled_pawn_penalty, eg_far_slider_penalty_mult, eg_king_pawn_ahead_penalty,
     eg_outpost_bonus, far_queen_penalty, far_rook_penalty, far_slider_cheb_max_excess,
-    far_slider_cheb_radius, giraffe, guard, hawk, huygen, king_defender_value_threshold,
+    far_slider_cheb_radius, giraffe, guard, hawk, huygen, king_defender_ref_value, tied_defender_ref_value,
     king_shield_ahead_max_dist, knight, knightrider, leaper_tropism_divisor, mg_bishop_pair_bonus,
     mg_doubled_pawn_penalty, mg_far_slider_penalty_mult, mg_king_pawn_ahead_penalty,
     mg_outpost_bonus, min_major_development_penalty,
     minor_development_penalty_threshold, passed_enemy_king_dist, passed_friendly_king_dist,
-    passed_pawn_adv_bonus, pawn, pawn_enemy_king_dist, pawn_far_from_promo_penalty,
+    passed_pawn_adv_bonus, pawn, pawn_enemy_king_dist, pawn_far_from_promo_max_penalty,
     pawn_friendly_king_dist, pawn_full_value_threshold, pawn_past_promo_penalty,
     piece_cloud_cheb_max_excess, piece_cloud_cheb_radius, queen_ideal_line_dist,
-    queen_open_file_bonus, queen_semi_open_file_bonus, queen_value, rook, rook_open_file_bonus,
+    queen, queen_open_file_bonus, queen_semi_open_file_bonus, rook, rook_open_file_bonus,
     rook_semi_open_file_bonus, rose, slider_axis_wiggle, slider_net_bonus, slider_threat_cap,
     slider_threat_div, zebra,
 min_fairy_development_penalty,
@@ -256,21 +260,21 @@ macro_rules! bump_feat {
 }
 
 pub const DEFAULT_EVAL_PAWN: i32 = 100;
-pub const DEFAULT_EVAL_KNIGHT: i32 = 255;
-pub const DEFAULT_EVAL_BISHOP: i32 = 434;
-pub const DEFAULT_EVAL_ROOK: i32 = 646;
-pub const DEFAULT_EVAL_GUARD: i32 = 180;
-pub const DEFAULT_EVAL_CENTAUR: i32 = 566;
-pub const DEFAULT_EVAL_COMPOUND_BONUS: i32 = 46;
-pub const DEFAULT_EVAL_CAMEL: i32 = 270;
-pub const DEFAULT_EVAL_GIRAFFE: i32 = 268;
-pub const DEFAULT_EVAL_ZEBRA: i32 = 272;
-pub const DEFAULT_EVAL_KNIGHTRIDER: i32 = 720;
+pub const DEFAULT_EVAL_KNIGHT: i32 = 315;
+pub const DEFAULT_EVAL_BISHOP: i32 = 450;
+pub const DEFAULT_EVAL_ROOK: i32 = 618;
+pub const DEFAULT_EVAL_GUARD: i32 = 232;
+pub const DEFAULT_EVAL_CENTAUR: i32 = 640;
+pub const DEFAULT_EVAL_QUEEN: i32 = 1380;
+pub const DEFAULT_EVAL_CAMEL: i32 = 195;
+pub const DEFAULT_EVAL_GIRAFFE: i32 = 165;
+pub const DEFAULT_EVAL_ZEBRA: i32 = 180;
+pub const DEFAULT_EVAL_KNIGHTRIDER: i32 = 800;
 pub const DEFAULT_EVAL_HAWK: i32 = 540;
-pub const DEFAULT_EVAL_ARCHBISHOP: i32 = 1060;
+pub const DEFAULT_EVAL_ARCHBISHOP: i32 = 1080;
 pub const DEFAULT_EVAL_ROSE: i32 = 997;
 pub const DEFAULT_EVAL_HUYGEN: i32 = 330;
-pub const DEFAULT_EVAL_CHANCELLOR_BONUS: i32 = 245;
+pub const DEFAULT_EVAL_CHANCELLOR: i32 = 1125;
 /// Amazon was the only compound priced at the bare sum of its parts, while the
 /// chancellor carries +245 over rook+knight and the archbishop +371.
 pub const DEFAULT_EVAL_MG_DOUBLED_PAWN_PENALTY: i32 = 10;
@@ -283,16 +287,20 @@ pub const DEFAULT_EVAL_QUEEN_OPEN_FILE_BONUS: i32 = 33;
 pub const DEFAULT_EVAL_QUEEN_SEMI_OPEN_FILE_BONUS: i32 = 19;
 pub const DEFAULT_EVAL_MG_OUTPOST_BONUS: i32 = 33;
 pub const DEFAULT_EVAL_EG_OUTPOST_BONUS: i32 = 56;
-pub const DEFAULT_EVAL_AMAZON_COMPOUND_BONUS: i32 = 200;
+pub const DEFAULT_EVAL_AMAZON: i32 = 1793;
 pub const DEFAULT_EVAL_SLIDER_NET_BONUS: i32 = 21;
 pub const DEFAULT_EVAL_FAR_SLIDER_CHEB_RADIUS: i32 = 18;
 pub const DEFAULT_EVAL_FAR_SLIDER_CHEB_MAX_EXCESS: i32 = 40;
 pub const DEFAULT_EVAL_FAR_QUEEN_PENALTY: i32 = 5;
+/// A slider re-enters the fight in one move, so drifting away costs it tempi,
+/// not a share of itself. The ramp is capped at this fraction of its value.
+pub const FAR_SLIDER_PENALTY_VALUE_DIV: i32 = 8;
 pub const DEFAULT_EVAL_FAR_ROOK_PENALTY: i32 = 7;
 pub const DEFAULT_EVAL_PIECE_CLOUD_CHEB_RADIUS: i32 = 16;
 pub const DEFAULT_EVAL_SLIDER_AXIS_WIGGLE: i32 = 5;
 pub const DEFAULT_EVAL_PIECE_CLOUD_CHEB_MAX_EXCESS: i32 = 64;
 pub const DEFAULT_EVAL_CLOUD_PENALTY_PER_100_VALUE: i32 = 2;
+pub const DEFAULT_EVAL_CLOUD_PENALTY_MAX_PCT: i32 = 50;
 pub const DEFAULT_EVAL_CLOUD_CENTER_MAX_SKEW_DIST: i32 = 16;
 pub const DEFAULT_EVAL_QUEEN_IDEAL_LINE_DIST: i32 = 4;
 pub const DEFAULT_EVAL_LEAPER_TROPISM_DIVISOR: i32 = 400;
@@ -303,11 +311,13 @@ pub const DEFAULT_EVAL_AMAZON_QUEEN_SCALE: i32 = 70;
 pub const DEFAULT_EVAL_CENTAUR_GUARD_SCALE: i32 = 50;
 pub const DEFAULT_EVAL_PAWN_FULL_VALUE_THRESHOLD: i32 = 6;
 pub const DEFAULT_EVAL_PAWN_PAST_PROMO_PENALTY: i32 = 90;
-pub const DEFAULT_EVAL_PAWN_FAR_FROM_PROMO_PENALTY: i32 = 48;
+pub const DEFAULT_EVAL_PAWN_FAR_FROM_PROMO_MAX_PENALTY: i32 = 100;
 pub const DEFAULT_EVAL_MINOR_DEVELOPMENT_PENALTY_THRESHOLD: i32 = 400;
 pub const DEFAULT_EVAL_MIN_MAJOR_DEVELOPMENT_PENALTY: i32 = 16;
 pub const DEFAULT_EVAL_MIN_FAIRY_DEVELOPMENT_PENALTY: i32 = 80;
-pub const DEFAULT_EVAL_KING_DEFENDER_VALUE_THRESHOLD: i32 = 400;
+pub const DEFAULT_EVAL_KING_DEFENDER_REF_VALUE: i32 = 250;
+pub const DEFAULT_EVAL_TIED_DEFENDER_REF_VALUE: i32 = 600;
+pub const DEFAULT_EVAL_CENTRALITY_VALUE_SCALE: i32 = 72;
 pub const DEFAULT_EVAL_COMPLEXITY_DAMP: i32 = 8;
 pub const DEFAULT_EVAL_COMPLEXITY_EXCESS_MAX: i32 = 40;
 pub const DEFAULT_EVAL_KING_SHIELD_AHEAD_MAX_DIST: i32 = 3;
@@ -315,8 +325,8 @@ pub const DEFAULT_EVAL_MG_KING_PAWN_AHEAD_PENALTY: i32 = 20;
 pub const DEFAULT_EVAL_EG_KING_PAWN_AHEAD_PENALTY: i32 = 0;
 pub const DEFAULT_EVAL_MG_FAR_SLIDER_PENALTY_MULT: i32 = 100;
 pub const DEFAULT_EVAL_EG_FAR_SLIDER_PENALTY_MULT: i32 = 44;
-pub const DEFAULT_EVAL_SLIDER_THREAT_DIV: i32 = 12;
-pub const DEFAULT_EVAL_SLIDER_THREAT_CAP: i32 = 41;
+pub const DEFAULT_EVAL_SLIDER_THREAT_DIV: i32 = 5;
+pub const DEFAULT_EVAL_SLIDER_THREAT_CAP: i32 = 100;
 pub const DEFAULT_EVAL_CANDIDATE_PASSER_BONUS_0: i32 = 2;
 pub const DEFAULT_EVAL_CANDIDATE_PASSER_BONUS_1: i32 = 0;
 pub const DEFAULT_EVAL_CANDIDATE_PASSER_BONUS_2: i32 = 12;
@@ -436,7 +446,7 @@ pub fn get_piece_value_base(piece_type: PieceType) -> i32 {
         PieceType::Knight => knight(),     // Weak in infinite chess
         PieceType::Bishop => bishop(),     // Strong slider
         PieceType::Rook => rook(),         // Very strong in infinite chess
-        PieceType::Queen => queen_value(), // > 2 rooks
+        PieceType::Queen => queen(),
         PieceType::Guard => guard(),
 
         // short / medium range
@@ -446,14 +456,14 @@ pub fn get_piece_value_base(piece_type: PieceType) -> i32 {
 
         // riders / compounds
         PieceType::Knightrider => knightrider(),
-        PieceType::Amazon => queen_value() + knight() + amazon_compound_bonus(),
+        PieceType::Amazon => amazon(),
         PieceType::Hawk => hawk(),
-        PieceType::Chancellor => rook() + knight() + chancellor_bonus(),
+        PieceType::Chancellor => chancellor(),
         PieceType::Archbishop => archbishop(),
         PieceType::Centaur => centaur(),
 
         PieceType::King => guard(),
-        PieceType::RoyalQueen => queen_value(),
+        PieceType::RoyalQueen => queen(),
         PieceType::RoyalCentaur => centaur(),
 
         // special infinite-board pieces
@@ -462,20 +472,33 @@ pub fn get_piece_value_base(piece_type: PieceType) -> i32 {
     }
 }
 
+/// Cloud-distance penalty, scaled by the piece's value and capped as a share of
+/// it. Uncapped this reached 128% of the piece, i.e. a far piece scored worse
+/// than no piece; truncating value to hundreds also made it step at boundaries.
+#[inline]
+fn cloud_penalty(excess: i32, piece_val: i32, mult: i32) -> i32 {
+    let p = excess as i64 * cloud_penalty_per_100_value() as i64 * piece_val as i64 * mult as i64;
+    let cap = piece_val as i64 * cloud_penalty_max_pct() as i64 / 100;
+    ((p / 10_000).min(cap)) as i32
+}
+
+/// A cheap piece shields a king; an expensive one standing there is tied down
+/// rather than defending. Scaled smoothly by value instead of cut off, so a
+/// mid-value piece still counts for part of it.
+#[inline]
+fn king_defender_bonus_for(bonus: i32, piece_val: i32) -> i32 {
+    let r = king_defender_ref_value();
+    (bonus as i64 * r as i64 / piece_val.max(r) as i64) as i32
+}
+
 pub fn get_centrality_weight(piece_type: PieceType) -> i64 {
     match piece_type {
+        // A king anchors where the action is; its material value does not say so.
         PieceType::King => 2000,
-        PieceType::Queen | PieceType::RoyalQueen | PieceType::Amazon => 1000,
-        PieceType::Rook | PieceType::Chancellor => 500,
-        PieceType::Bishop | PieceType::Archbishop => 300,
-        PieceType::Knight | PieceType::Centaur | PieceType::RoyalCentaur => 300,
-        PieceType::Camel | PieceType::Giraffe | PieceType::Zebra => 300,
-        PieceType::Knightrider => 400,
-        PieceType::Hawk => 350,
-        PieceType::Rose => 350,
-        PieceType::Guard | PieceType::Huygen => 250,
-        // Pawns and others have 0 weight for "Piece Cloud" centrality
-        _ => 0,
+        PieceType::Pawn | PieceType::Void | PieceType::Obstacle => 0,
+        // Everything else pulls the cloud centre in proportion to what it is worth,
+        // so a compound outweighs the slider it contains.
+        _ => get_piece_value_base(piece_type) as i64 * centrality_value_scale() as i64 / 100,
     }
 }
 
@@ -782,8 +805,7 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
     // Sliders are graded by value gap rather than bucketed: on an unbounded
     // board they are the pieces that can threaten from anywhere, and a fixed
     // tier would have to be re-cut every time the piece values are refitted.
-    const MINOR_THREATENS_ROOK: i32 = 20;
-    const MINOR_THREATENS_QUEEN: i32 = 35;
+    const MINOR_THREATENS_ROYAL: i32 = 20;
 
     const KNIGHT_OFFSETS: [(i64, i64); 8] = [
         (2, 1),
@@ -1099,20 +1121,22 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                                             dy,
                                         ) && target.color() == enemy
                                         {
-                                            let tv = get_piece_value_base(target.piece_type());
-                                            let mv = piece_val;
-                                            if tv >= 600 && mv < 600 {
-                                                if is_white {
-                                                    w_minor_threats += MINOR_THREATENS_QUEEN;
-                                                } else {
-                                                    b_minor_threats += MINOR_THREATENS_QUEEN;
-                                                }
-                                            } else if tv >= 400 && mv < 400 {
-                                                if is_white {
-                                                    w_minor_threats += MINOR_THREATENS_ROOK;
-                                                } else {
-                                                    b_minor_threats += MINOR_THREATENS_ROOK;
-                                                }
+                                            let tt = target.piece_type();
+                                            let tv = get_piece_value_base(tt);
+                                            // The old value gates excluded the
+                                            // centaur from its own branch, since
+                                            // both required a cheap attacker.
+                                            let add = if tt.is_royal() {
+                                                MINOR_THREATENS_ROYAL
+                                            } else {
+                                                let raw = (tv - piece_val).max(tv / 4);
+                                                (raw / slider_threat_div())
+                                                    .min(slider_threat_cap())
+                                            };
+                                            if is_white {
+                                                w_minor_threats += add;
+                                            } else {
+                                                b_minor_threats += add;
                                             }
                                         }
                                     }
@@ -1228,14 +1252,10 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                                             w_pawn_penalty -= pawn_past_promo_penalty();
                                         } else {
                                             let dist = w_promo - y;
-                                            if dist > pawn_full_value_threshold() as i64 {
-                                                w_pawn_bonus -= pawn_far_from_promo_penalty();
-                                            } else {
-                                                w_pawn_bonus += (pawn_full_value_threshold() as i64
-                                                    - dist)
-                                                    as i32
-                                                    * 6;
-                                            }
+                                            let bonus =
+                                                (pawn_full_value_threshold() - dist.min(255) as i32) * 6;
+
+                                            w_pawn_bonus += bonus.max(-pawn_far_from_promo_max_penalty());
                                             if y > white_max_y {
                                                 white_max_y = y;
                                             }
@@ -1271,14 +1291,10 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                                             b_pawn_penalty -= pawn_past_promo_penalty();
                                         } else {
                                             let dist = y - b_promo;
-                                            if dist > pawn_full_value_threshold() as i64 {
-                                                b_pawn_bonus -= pawn_far_from_promo_penalty();
-                                            } else {
-                                                b_pawn_bonus += (pawn_full_value_threshold() as i64
-                                                    - dist)
-                                                    as i32
-                                                    * 6;
-                                            }
+                                            let bonus =
+                                                (pawn_full_value_threshold() - dist.min(255) as i32) * 6;
+
+                                            b_pawn_bonus += bonus.max(-pawn_far_from_promo_max_penalty());
                                             if y < black_min_y {
                                                 black_min_y = y;
                                             }
@@ -1803,6 +1819,14 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
                     black_pawns,
                 );
                 rook_eval * chancellor_rook_scale() / 100
+                    + evaluate_compound_leap_threats(
+                        game,
+                        x,
+                        y,
+                        piece.color(),
+                        get_piece_value_base(pt),
+                        phase,
+                    )
             }
             PieceType::Archbishop => {
                 let bishop_eval = evaluate_bishop(
@@ -1817,6 +1841,14 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
                     black_pawns,
                 );
                 bishop_eval * archbishop_bishop_scale() / 100
+                    + evaluate_compound_leap_threats(
+                        game,
+                        x,
+                        y,
+                        piece.color(),
+                        get_piece_value_base(pt),
+                        phase,
+                    )
             }
             PieceType::Amazon => {
                 let queen_eval = evaluate_queen(
@@ -1841,7 +1873,16 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
                     white_pawns,
                     black_pawns,
                 );
-                (queen_eval * amazon_queen_scale() / 100) + (rook_eval * amazon_rook_scale() / 100)
+                (queen_eval * amazon_queen_scale() / 100)
+                    + (rook_eval * amazon_rook_scale() / 100)
+                    + evaluate_compound_leap_threats(
+                        game,
+                        x,
+                        y,
+                        piece.color(),
+                        get_piece_value_base(pt),
+                        phase,
+                    )
             }
             PieceType::RoyalQueen => evaluate_queen(
                 game,
@@ -1864,19 +1905,53 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
                 white_pawns,
                 black_pawns,
             ),
-            PieceType::Hawk
-            | PieceType::Rose
-            | PieceType::Camel
-            | PieceType::Giraffe
-            | PieceType::Zebra => evaluate_leaper_positioning(
-                x,
-                y,
-                piece.color(),
-                cloud_center.as_ref(),
-                pt,
-                cloud_avg_spread,
-                phase,
-            ),
+            PieceType::Rose => {
+                evaluate_leaper_positioning(
+                    x,
+                    y,
+                    piece.color(),
+                    cloud_center.as_ref(),
+                    PieceType::Rose,
+                    cloud_avg_spread,
+                    phase,
+                ) + evaluate_rose_reach(game, x, y, piece.color(), phase)
+            }
+            // The odd leapers had no threat term at all, while a knight on the
+            // same square earned one: a camel forking two pieces scored nothing.
+            // The hawk keeps its old scoring; its variants regressed when changed.
+            PieceType::Camel | PieceType::Giraffe | PieceType::Zebra | PieceType::Hawk => {
+                let offsets: &[(i64, i64)] = match pt {
+                    PieceType::Camel => &crate::attacks::CAMEL_OFFSETS,
+                    PieceType::Giraffe => &crate::attacks::GIRAFFE_OFFSETS,
+                    PieceType::Zebra => &crate::attacks::ZEBRA_OFFSETS,
+                    _ => &crate::attacks::HAWK_OFFSETS,
+                };
+                evaluate_leaper_positioning(
+                    x,
+                    y,
+                    piece.color(),
+                    cloud_center.as_ref(),
+                    pt,
+                    cloud_avg_spread,
+                    phase,
+                ) + {
+                    // Guarding material is a cheap piece's job; a flat defend credit
+                    // rooted hawks to their dense home cluster (-114 Elo in CoaIP),
+                    // the same inverse-value frame as king_defender_bonus_for.
+                    let v = get_piece_value_base(pt);
+                    let r = crate::search::params::king_defender_ref_value();
+                    crate::evaluation::piece_reach::evaluate_leap_threats(
+                        game,
+                        x,
+                        y,
+                        piece.color(),
+                        v,
+                        phase,
+                        offsets,
+                        4 * r / v.max(r),
+                    )
+                }
+            }
             PieceType::Centaur | PieceType::RoyalCentaur => {
                 let leaper_eval = evaluate_leaper_positioning(
                     x,
@@ -1889,36 +1964,58 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
                 );
                 leaper_eval * centaur_guard_scale() / 100
             }
-            PieceType::Huygen => evaluate_leaper_positioning(
+            PieceType::Huygen => evaluate_huygen_reach(
+                &game.spatial_indices,
                 x,
                 y,
                 piece.color(),
-                cloud_center.as_ref(),
-                PieceType::Huygen,
-                cloud_avg_spread,
+                if piece.color() == PlayerColor::White {
+                    black_royals
+                } else {
+                    white_royals
+                },
                 phase,
             ),
-            PieceType::Guard => evaluate_leaper_positioning(
-                x,
-                y,
-                piece.color(),
-                cloud_center.as_ref(),
-                PieceType::Guard,
-                cloud_avg_spread,
-                phase,
-            ),
+            // A guard had no threat term at all: it is not in the knight bucket
+            // branch, not a slider, and was not in the leaper arm, so a guard
+            // attacking a rook scored nothing.
+            PieceType::Guard => {
+                let v = get_piece_value_base(pt);
+                let r = crate::search::params::king_defender_ref_value();
+                crate::evaluation::piece_reach::evaluate_leap_threats(
+                    game,
+                    x,
+                    y,
+                    piece.color(),
+                    v,
+                    phase,
+                    &crate::attacks::KING_OFFSETS,
+                    4 * r / v.max(r),
+                )
+                    + evaluate_leaper_positioning(
+                        x,
+                        y,
+                        piece.color(),
+                        cloud_center.as_ref(),
+                        PieceType::Guard,
+                        cloud_avg_spread,
+                        phase,
+                    )
+            }
             // A knightrider rides along knight rays; on an unbounded board its
             // reach is unbounded so mobility-counting is meaningless. Use the
             // board-aware cloud-proximity/density shaping like the other riders.
-            PieceType::Knightrider => evaluate_leaper_positioning(
-                x,
-                y,
-                piece.color(),
-                cloud_center.as_ref(),
-                PieceType::Knightrider,
-                cloud_avg_spread,
-                phase,
-            ),
+            PieceType::Knightrider => {
+                evaluate_leaper_positioning(
+                    x,
+                    y,
+                    piece.color(),
+                    cloud_center.as_ref(),
+                    PieceType::Knightrider,
+                    cloud_avg_spread,
+                    phase,
+                ) + evaluate_knightrider_reach(x, y, piece.color(), piece_list, phase)
+            }
             _ => 0,
         };
         let piece_val = get_piece_value_base(pt);
@@ -1933,7 +2030,6 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
                 let is_diag = pt == PieceType::Bishop || pt == PieceType::Archbishop;
                 let is_queen = pt == PieceType::Queen || pt == PieceType::Amazon;
 
-                let value_factor = (piece_val / 100).max(1);
                 let mult = taper(mg_far_slider_penalty_mult(), eg_far_slider_penalty_mult());
 
                 if is_ortho || is_diag || is_queen {
@@ -1954,18 +2050,14 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
                         let excess = (lane_dist - slider_axis_wiggle() as i64)
                             .min(piece_cloud_cheb_max_excess() as i64)
                             as i32;
-                        let penalty =
-                            excess * cloud_penalty_per_100_value() * value_factor * mult / 100;
-                        piece_score -= penalty;
+                        piece_score -= cloud_penalty(excess, piece_val, mult);
                     }
                 } else {
                     // Leapers/Others: penalized by distance (Chebyshev)
                     // We are only in this block if cheb > RADIUS, so dist_to_radius > 0
                     let dist_to_radius = cheb - piece_cloud_cheb_radius() as i64;
                     let excess = dist_to_radius.min(piece_cloud_cheb_max_excess() as i64) as i32;
-                    let penalty =
-                        excess * cloud_penalty_per_100_value() * value_factor * mult / 100;
-                    piece_score -= penalty;
+                    piece_score -= cloud_penalty(excess, piece_val, mult);
                 }
             }
         }
@@ -1979,14 +2071,10 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
             // which suits neither, so they are priced apart.
             piece_score -= if pt.is_minor() {
                 if matches!(pt, PieceType::Knight | PieceType::Bishop) {
-                    // A knight or bishop below the threshold costs nothing for
-                    // sitting at home -- tuned to exactly 0, so the branch and its
-                    // threshold check are skipped rather than computed and discarded.
-                    if piece_val < minor_development_penalty_threshold() {
-                        0
-                    } else {
-                        min_major_development_penalty()
-                    }
+                    // Ramped in value rather than flipped at a threshold, which paid
+                    // a bishop the full penalty and a knight none at all.
+                    min_major_development_penalty() * piece_val
+                        / minor_development_penalty_threshold().max(1)
                 } else {
                     min_fairy_development_penalty()
                 }
@@ -2004,12 +2092,13 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
             for &ok in own_royals {
                 let dist = (x - ok.x).abs().max((y - ok.y).abs());
                 if dist <= 3 {
-                    if piece_val < king_defender_value_threshold() {
-                        piece_score += taper(
+                    piece_score += king_defender_bonus_for(
+                        taper(
                             crate::search::params::mg_king_defender_bonus(),
                             crate::search::params::eg_king_defender_bonus(),
-                        );
-                    }
+                        ),
+                        piece_val,
+                    );
                     break; // Count once
                 }
             }
@@ -2438,7 +2527,8 @@ pub fn evaluate_rook(
     if min_cheb != i64::MAX && min_cheb > far_slider_cheb_radius() as i64 {
         let excess = (min_cheb - far_slider_cheb_radius() as i64)
             .min(far_slider_cheb_max_excess() as i64) as i32;
-        bonus -= excess * far_rook_penalty();
+        let cap = get_piece_value_base(PieceType::Rook) / FAR_SLIDER_PENALTY_VALUE_DIV;
+        bonus -= (excess * far_rook_penalty()).min(cap);
     }
 
     // Open / Semi-Open File Bonus
@@ -2554,7 +2644,8 @@ pub fn evaluate_queen(
     if min_cheb != i64::MAX && min_cheb > far_slider_cheb_radius() as i64 {
         let excess = (min_cheb - far_slider_cheb_radius() as i64)
             .min(far_slider_cheb_max_excess() as i64) as i32;
-        bonus -= excess * far_queen_penalty();
+        let cap = get_piece_value_base(PieceType::Queen) / FAR_SLIDER_PENALTY_VALUE_DIV;
+        bonus -= (excess * far_queen_penalty()).min(cap);
     }
 
     // Open / Semi-Open File Bonus
@@ -2715,9 +2806,6 @@ fn evaluate_knight(
     bonus
 }
 
-/// Scores leapers on proximity to the piece cloud's center, on how tightly the
-/// position is clustered, and on a phase taper that lifts short-range leapers as the
-/// board empties.
 fn evaluate_leaper_positioning(
     x: i64,
     y: i64,
@@ -2744,10 +2832,7 @@ fn evaluate_leaper_positioning(
     // Spread runs 0..=cloud_center_max_skew_dist() as i64 and is neutral at 8, so a positive
     // density_adj means a clustered position and a leaper bonus.
     let density_sensitivity: i32 = match piece_type {
-        PieceType::Knight => 35,
-        PieceType::Camel => 30,
-        PieceType::Zebra => 25,
-        PieceType::Giraffe => 20,
+        PieceType::Knight | PieceType::Camel | PieceType::Zebra | PieceType::Giraffe => 35,
         PieceType::Guard => 25,
         PieceType::Hawk => 15,
         PieceType::Centaur | PieceType::RoyalCentaur => 22,
@@ -2760,10 +2845,7 @@ fn evaluate_leaper_positioning(
 
     // 3. PHASE TAPER
     let (mg_bonus, eg_bonus): (i32, i32) = match piece_type {
-        PieceType::Knight => (0, 30),
-        PieceType::Camel => (0, 23),
-        PieceType::Zebra => (0, 20),
-        PieceType::Giraffe => (0, 15),
+        PieceType::Knight | PieceType::Camel | PieceType::Zebra | PieceType::Giraffe => (0, 30),
         PieceType::Guard => (0, 20),
         PieceType::Hawk => (0, 10),
         PieceType::Centaur | PieceType::RoyalCentaur => (0, 20),
@@ -2906,9 +2988,7 @@ fn evaluate_king_shelter(
                 blocker = Some((0, 1));
             } else if c == color {
                 blocker = Some((val, dist));
-                if val >= 600 {
-                    tied_defender_penalty += 10;
-                }
+                tied_defender_penalty += 10 * val / tied_defender_ref_value();
             } else if c == PlayerColor::Neutral {
                 // Neutral pieces (Void/Obstacle)
                 // Void -> Perfect blocker (dist 1) like world border
@@ -2950,9 +3030,7 @@ fn evaluate_king_shelter(
                 blocker = Some((0, 1));
             } else if c == color {
                 blocker = Some((val, dist));
-                if val >= 600 {
-                    tied_defender_penalty += 12;
-                }
+                tied_defender_penalty += 12 * val / tied_defender_ref_value();
             } else if c == PlayerColor::Neutral {
                 if pt == PieceType::Void {
                     blocker = Some((0, 1));
@@ -4563,3 +4641,4 @@ mod tests {
         );
     }
 }
+

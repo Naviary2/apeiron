@@ -115,7 +115,7 @@ impl TTEntry {
             } else {
                 Some(PieceType::from_u8(pr))
             },
-            rook_coord: None,
+            partner_coord: None,
         })
     }
 
@@ -327,23 +327,7 @@ impl LocalTranspositionTable {
                     params.rule_limit,
                 );
 
-                let mut cutoff = INFINITY + 1;
-
-                if e.depth as usize >= params.depth {
-                    let flag = e.flag();
-                    let usable = match flag {
-                        TTFlag::Exact => true,
-                        TTFlag::LowerBound if score >= params.beta => true,
-                        TTFlag::UpperBound if score <= params.alpha => true,
-                        _ => false,
-                    };
-                    if usable {
-                        cutoff = score;
-                    }
-                }
-
                 return Some(TTProbeResult {
-                    cutoff_score: cutoff,
                     tt_score: score,
                     eval: eval_from_i16(e.eval16 as i32),
                     depth: e.depth,
@@ -354,6 +338,24 @@ impl LocalTranspositionTable {
             }
         }
         None
+    }
+
+    /// Shaves plies off an entry that was deep enough to cut but carried the wrong
+    /// bound, so a real search can replace it instead of it being re-probed for a
+    /// cutoff it can never give.
+    #[inline(always)]
+    pub fn penalize(&self, hash: u64, penalty: u8) {
+        let key16 = self.hash_key16(hash);
+        let idx = (hash as usize) & self.mask;
+        unsafe {
+            let entries = &mut (*self.buckets.add(idx)).entries;
+            for e in entries {
+                if e.key16 == key16 && !e.is_empty() {
+                    e.depth = e.depth.saturating_sub(penalty);
+                    return;
+                }
+            }
+        }
     }
 
     /// Stores results in the TT, replacing existing entries based on
@@ -404,7 +406,13 @@ impl LocalTranspositionTable {
                         if let Some(m) = &params.best_move {
                             e.encode_move(m, params.hash);
                         }
-                    } else if e.depth >= 5 && e.flag() != TTFlag::Exact {
+                    } else if e.depth >= 5
+                        && e.flag() != TTFlag::Exact
+                        && super::is_decisive(score_from_i16(e.score16 as i32))
+                    {
+                        // Only a decisive bound decays. Aging ordinary deep bounds
+                        // costs cutoffs table-wide; a stale mate bound is what has to
+                        // lose depth so a fresher search can replace it.
                         e.depth = e.depth.saturating_sub(1);
                     }
                     return;
@@ -488,7 +496,6 @@ mod tests {
                 rule_limit: 100,
             })
             .unwrap();
-        assert_eq!(res.cutoff_score, 100);
         assert_eq!(res.eval, 90);
     }
 
@@ -501,7 +508,7 @@ mod tests {
             to: Coordinate::new(4, 4),
             piece: Piece::new(PieceType::Pawn, PlayerColor::White),
             promotion: None,
-            rook_coord: None,
+            partner_coord: None,
         };
         tt.store(&TTStoreParams {
             hash,
@@ -538,7 +545,7 @@ mod tests {
             to: Coordinate::new(-4000, 4000),
             piece: Piece::new(PieceType::Rook, PlayerColor::Black),
             promotion: None,
-            rook_coord: None,
+            partner_coord: None,
         };
         assert!(e.encode_move(&m, 0));
         let decoded = e.best_move(0).unwrap();

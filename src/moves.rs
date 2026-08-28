@@ -1,6 +1,6 @@
 use crate::board::{Board, Coordinate, Piece, PieceType, PlayerColor};
 use crate::game::{EnPassantState, GameRules};
-use crate::utils::{PRIMES_UNDER_128, is_prime_fast, is_prime_i64};
+use crate::utils::{PRIMES_UNDER_128, is_prime_fast};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
@@ -184,7 +184,10 @@ fn generate_knightrider_moves(board: &Board, from: &Coordinate, piece: &Piece) -
         // 2. Generate moves along this ray.
         // Cap at 10 for performance - captures at distance handled separately
         const KR_STEP_LIMIT: i64 = 10;
-        const KR_OPEN_RAY_STEPS: i64 = 5;
+        // Open rays reach as far as blocked ones: the eval-gap audit's only
+        // measured win over the candidate filter was a 5-8 hop knightrider
+        // maneuver, i.e. destinations the old window of 5 cut off.
+        const KR_OPEN_RAY_STEPS: i64 = KR_STEP_LIMIT;
         let max_steps: i64 = if closest_k < i64::MAX {
             if closest_is_enemy {
                 closest_k.min(KR_STEP_LIMIT)
@@ -842,7 +845,7 @@ pub struct Move {
     pub to: Coordinate,
     pub piece: Piece,
     pub promotion: Option<PieceType>,
-    pub rook_coord: Option<Coordinate>, // For castling: stores the rook's coordinate
+    pub partner_coord: Option<Coordinate>, // For castling: stores the rook's coordinate
 }
 
 impl Move {
@@ -852,7 +855,7 @@ impl Move {
             to,
             piece,
             promotion: None,
-            rook_coord: None,
+            partner_coord: None,
         }
     }
 }
@@ -862,7 +865,7 @@ pub fn is_enemy_piece(piece: &Piece, our_color: PlayerColor) -> bool {
     piece.color() != our_color && piece.piece_type() != PieceType::Void
 }
 
-pub fn get_legal_moves_into(
+pub fn get_pseudo_legal_moves_into(
     board: &Board,
     turn: PlayerColor,
     ctx: &MoveGenContext,
@@ -912,9 +915,9 @@ pub fn get_legal_moves_into(
     }
 }
 
-pub fn get_legal_moves(board: &Board, turn: PlayerColor, ctx: &MoveGenContext) -> MoveList {
+pub fn get_pseudo_legal_moves(board: &Board, turn: PlayerColor, ctx: &MoveGenContext) -> MoveList {
     let mut moves = MoveList::new();
-    get_legal_moves_into(board, turn, ctx, &mut moves);
+    get_pseudo_legal_moves_into(board, turn, ctx, &mut moves);
     moves
 }
 
@@ -1498,8 +1501,7 @@ pub fn is_square_attacked(
                     let abs_dist_to_target = dist_to_target.abs();
 
                     // Target must be at a prime distance from the Huygens
-                    // Use is_prime_i64 for arbitrary distances (handles extreme coordinates)
-                    if !is_prime_i64(abs_dist_to_target) {
+                    if !is_prime_fast(abs_dist_to_target) {
                         continue;
                     }
 
@@ -1531,8 +1533,7 @@ pub fn is_square_attacked(
 
                         let abs_dist_from_huygen = dist_from_huygen.abs();
                         // If this piece is at a prime distance from the Huygens, it blocks!
-                        // Use is_prime_i64 for arbitrary distances
-                        if is_prime_i64(abs_dist_from_huygen) {
+                        if is_prime_fast(abs_dist_from_huygen) {
                             blocked = true;
                             break;
                         }
@@ -1822,7 +1823,7 @@ fn generate_castling_moves(
                         let to_x = from.x + (dir * 2);
                         let mut castling_move =
                             Move::new(*from, Coordinate::new(to_x, from.y), *piece);
-                        castling_move.rook_coord = Some(*coord);
+                        castling_move.partner_coord = Some(*coord);
                         moves.push(castling_move);
                     }
                 }
@@ -2348,6 +2349,70 @@ fn ray_border_distance(from: &Coordinate, dir_x: i64, dir_y: i64) -> Option<i64>
     } else {
         None
     }
+}
+
+/// Clear room a ray needs before a slider gets its one far escape move. Bounded
+/// variants never reach it, so they pay nothing for this.
+const FAR_ESCAPE_MIN_ROOM: i64 = 50;
+
+/// The escape lands on a shell inset from the TT move-encoding box, not on its
+/// edge: the wiggle candidates other pieces generate around the landed piece are
+/// `dist +- 2`, and those must still encode.
+const FAR_SHELL_INSET: i64 = 32;
+const FAR_SHELL_MAX: i64 = crate::search::tt_defs::MAX_TT_COORD - FAR_SHELL_INSET;
+const FAR_SHELL_MIN: i64 = crate::search::tt_defs::MIN_TT_COORD + FAR_SHELL_INSET;
+
+/// Steps along a ray to the far-escape shell, 0 once the mover is on or past it.
+/// The shell is an absolute anchor, which is what bounds the branching: after the
+/// escape this returns 0, so no second, farther escape is ever generated.
+#[inline]
+fn ray_far_escape_steps(from: &Coordinate, dir_x: i64, dir_y: i64) -> i64 {
+    #[inline(always)]
+    fn axis_steps(pos: i64, dir: i64, world_min: i64, world_max: i64) -> i64 {
+        if dir == 0 {
+            return i64::MAX;
+        }
+        let room = if dir > 0 {
+            world_max.min(FAR_SHELL_MAX).saturating_sub(pos)
+        } else {
+            pos.saturating_sub(world_min.max(FAR_SHELL_MIN))
+        };
+        room.max(0) / dir.abs()
+    }
+
+    let sx = axis_steps(
+        from.x,
+        dir_x,
+        COORD_MIN_X.load(Ordering::Relaxed),
+        COORD_MAX_X.load(Ordering::Relaxed),
+    );
+    let sy = axis_steps(
+        from.y,
+        dir_y,
+        COORD_MIN_Y.load(Ordering::Relaxed),
+        COORD_MAX_Y.load(Ordering::Relaxed),
+    );
+    sx.min(sy)
+}
+
+/// Whether a move is one of the far escapes above, i.e. its destination is the
+/// shell square of its own ray. Recomputed rather than flagged on [`Move`], which
+/// would cost 8 bytes in every move list for a move that is generated once a node.
+#[inline]
+pub fn is_far_escape_move(m: &Move) -> bool {
+    let dx = m.to.x - m.from.x;
+    let dy = m.to.y - m.from.y;
+    if dx.abs().max(dy.abs()) < FAR_ESCAPE_MIN_ROOM {
+        return false;
+    }
+    let steps = if dx == 0 {
+        dy.abs()
+    } else if dy == 0 || dx.abs() == dy.abs() {
+        dx.abs()
+    } else {
+        return false;
+    };
+    ray_far_escape_steps(&m.from, dx / steps, dy / steps) == steps
 }
 
 /// Distance past which a candidate square needs a reason beyond proximity to be
@@ -3253,6 +3318,21 @@ fn generate_sliding_moves_impl(
                     out.push(Move::new(*from, Coordinate::new(sq_x, sq_y), *piece));
                 }
             }
+
+            // A fully open ray is provably empty to the border, but the candidate
+            // window tops out at 256, so a slider can never just run away. One
+            // escape to the far shell fixes that; it is deliberately outside the
+            // cached candidate list, which is never invalidated.
+            if gen_type != MoveGenType::Captures
+                && closest_dist == i64::MAX
+                && ray_cap == 0
+            {
+                let far = ray_far_escape_steps(from, dir_x, dir_y);
+                if far >= FAR_ESCAPE_MIN_ROOM && target_dists.binary_search(&far).is_err() {
+                    let sq = Coordinate::new(from.x + dir_x * far, from.y + dir_y * far);
+                    out.push(Move::new(*from, sq, *piece));
+                }
+            }
         }
     }
 }
@@ -3321,10 +3401,14 @@ pub fn generate_huygen_moves_into(
     // Limit for moves when no blocker is found (use cross-ray logic beyond this)
     const OPEN_RAY_LIMIT: i64 = 50;
 
-    for &(dir_x, dir_y) in &ORTHO_DIRECTIONS {
-        // Find the closest blocker at a prime distance in this direction
-        let (blocker_dist, blocker_color) =
-            find_huygen_blocker(board, from, dir_x, dir_y, indices, my_color);
+    // Per-direction first prime-distance blocker, reused by the sniper pass below.
+    let mut blockers = [(i64::MAX, None); 4];
+    for (i, &(dx, dy)) in ORTHO_DIRECTIONS.iter().enumerate() {
+        blockers[i] = find_huygen_blocker(board, from, dx, dy, indices, my_color);
+    }
+
+    for (di, &(dir_x, dir_y)) in ORTHO_DIRECTIONS.iter().enumerate() {
+        let (blocker_dist, blocker_color) = blockers[di];
 
         if blocker_dist < i64::MAX {
             // CASE 1: Blocker found at prime distance
@@ -3393,7 +3477,240 @@ pub fn generate_huygen_moves_into(
             }
         }
     }
+
+    // Sniper landings: a quiet hop onto an open ray placed so a chosen enemy on
+    // this line becomes the FIRST prime-distance piece, i.e. directly attacked
+    // next move with everything between at composite offsets. These are exactly
+    // the quiets the open-ray filter above prunes. Skipped under tight gen.
+    if gen_type != MoveGenType::Captures && QUIET_RAY_CAP.with(|c| c.get()) == 0 {
+        generate_huygen_snipes(from, piece, indices, &blockers, out);
+    }
 }
+
+/// Far-landing candidates tried per side; SNIPE_PRIMES sizes its sieve from
+/// this directly, so raising it does not need a matching manual bump there.
+const SNIPE_TRIES: usize = 128;
+
+/// See the caller: emits at most one landing per enemy on the huygen row and
+/// column. A landing must sit on an open side (every prime distance there is
+/// provably empty), and duplicates of the base generation are filtered out.
+fn generate_huygen_snipes(
+    from: &Coordinate,
+    piece: &Piece,
+    indices: &SpatialIndices,
+    blockers: &[(i64, Option<PlayerColor>); 4],
+    out: &mut MoveList,
+) {
+    let my_color = piece.color();
+
+    let lines = [
+        (indices.rows.get(&from.y), from.x, blockers[0].0, blockers[1].0, true),
+        (indices.cols.get(&from.x), from.y, blockers[2].0, blockers[3].0, false),
+    ];
+
+    for (line, our, pos_block, neg_block, horizontal) in lines {
+        let Some(vec) = line else { continue };
+        let open_pos = pos_block == i64::MAX;
+        let open_neg = neg_block == i64::MAX;
+        if !open_pos && !open_neg {
+            continue;
+        }
+
+        // A landing is only emitted when the base pass could not have: it already
+        // generates every prime short of a blocker, and open-ray primes <= 3 or
+        // cross-ray-aligned ones under its cap.
+        let push_landing = |s_off: i64, out: &mut MoveList| {
+            let (tx, ty) = if horizontal {
+                (our + s_off, from.y)
+            } else {
+                (from.x, our + s_off)
+            };
+            if !in_bounds(tx, ty) {
+                return;
+            }
+            let d = s_off.abs();
+            if d <= 3 {
+                return;
+            }
+            if d <= 50 {
+                let aligned = if horizontal {
+                    indices.cols.get(&tx).is_some_and(|v| !v.is_empty())
+                } else {
+                    indices.rows.get(&ty).is_some_and(|v| !v.is_empty())
+                };
+                if aligned {
+                    return;
+                }
+            }
+            out.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
+        };
+
+        // A landing offset is reachable exactly when its side is open and the
+        // distance is prime; every such square is provably empty.
+        let reachable_open = |s_off: i64| -> bool {
+            if s_off > 0 {
+                open_pos && is_prime_fast(s_off)
+            } else {
+                open_neg && is_prime_fast(-s_off)
+            }
+        };
+
+        let mut max_off = 0i64;
+        let mut min_off = 0i64;
+        for (c, _) in vec {
+            let off = c - our;
+            max_off = max_off.max(off);
+            min_off = min_off.min(off);
+        }
+
+        // SNIPE_TRIES candidates BEYOND the line's outermost piece on each open
+        // side, so the count never depends on where the pieces happen to sit.
+        // Borrowed as slices rather than collected: 2 x SNIPE_TRIES overflowed
+        // the inline SmallVec and heap-allocated on every call.
+        let side_slice = |open: bool, base: i64| -> &[i64] {
+            if !open {
+                return &[];
+            }
+            let start = SNIPE_PRIMES.partition_point(|&p| p <= base);
+            let end = (start + SNIPE_TRIES).min(SNIPE_PRIMES.len());
+            &SNIPE_PRIMES[start..end]
+        };
+        let pos_cands = side_slice(open_pos, max_off);
+        let neg_cands = side_slice(open_neg, -min_off);
+
+        // Landings 2 short of or past a target always attack (nothing can
+        // interpose at distance 1), collected once per line like the far
+        // candidates above rather than re-derived per target.
+        let mut close: smallvec::SmallVec<[i64; 16]> = smallvec::SmallVec::new();
+        for (c, packed) in vec {
+            let t_off = c - our;
+            if t_off == 0 {
+                continue;
+            }
+            let target = Piece::from_packed(packed);
+            if target.color() == my_color
+                || target.color() == PlayerColor::Neutral
+                || target.piece_type() == PieceType::Void
+            {
+                continue;
+            }
+            for s_off in [t_off + 2, t_off - 2] {
+                if s_off != 0 && !close.contains(&s_off) {
+                    close.push(s_off);
+                }
+            }
+        }
+
+        // A huygen only attacks the nearest prime-distance piece per side, so
+        // asking each landing that question covers every target in one pass.
+        // Keeps the single best landing per target: the widest gap to the next
+        // lower prime, the only stretch a piece could interpose in, so the
+        // wider the gap the harder the attack is to block.
+        let mut best: smallvec::SmallVec<[(i64, i64, i64); 16]> = smallvec::SmallVec::new();
+
+        let far = pos_cands
+            .iter()
+            .map(|&p| p)
+            .chain(neg_cands.iter().map(|&p| -p));
+        for s_off in close.iter().copied().chain(far) {
+            if !reachable_open(s_off) {
+                continue;
+            }
+            // Nearest prime-distance piece below and above the landing; a huygen
+            // there attacks those two and nothing else on the line.
+            // coords are sorted, so the nearest prime-distance piece per side is
+            // found by walking outward from the landing and stopping at the first
+            // hit, instead of scanning the whole line and taking a minimum.
+            let landing = our + s_off;
+            let split = vec.coords.partition_point(|&c| c < landing);
+            let probe = |o2: i64, packed2: u8| -> Option<(i64, i64, u8)> {
+                if o2 == s_off || o2 == 0 {
+                    return None;
+                }
+                let d = (s_off - o2).abs();
+                is_prime_fast(d).then_some((d, o2, packed2))
+            };
+            let mut lo_hit: Option<(i64, i64, u8)> = None;
+            for i in (0..split).rev() {
+                if let Some(h) = probe(vec.coords[i] - our, vec.pieces[i]) {
+                    lo_hit = Some(h);
+                    break;
+                }
+            }
+            let mut hi_hit: Option<(i64, i64, u8)> = None;
+            for i in split..vec.coords.len() {
+                if let Some(h) = probe(vec.coords[i] - our, vec.pieces[i]) {
+                    hi_hit = Some(h);
+                    break;
+                }
+            }
+
+            for (d, o2, packed2) in [lo_hit, hi_hit].into_iter().flatten() {
+                let t = Piece::from_packed(packed2);
+                if t.color() == my_color
+                    || t.color() == PlayerColor::Neutral
+                    || t.piece_type() == PieceType::Void
+                {
+                    continue;
+                }
+                let reach = block_free_span(d);
+                match best.iter_mut().find(|(target, _, _)| *target == o2) {
+                    Some(entry) => {
+                        if reach > entry.1 {
+                            entry.1 = reach;
+                            entry.2 = s_off;
+                        }
+                    }
+                    None => best.push((o2, reach, s_off)),
+                }
+            }
+        }
+
+        // Two targets can share one landing, and a duplicate move corrupts perft.
+        let mut used: smallvec::SmallVec<[i64; 16]> = smallvec::SmallVec::new();
+        for &(_, _, s_off) in &best {
+            if !used.contains(&s_off) {
+                used.push(s_off);
+                push_landing(s_off, out);
+            }
+        }
+    }
+}
+
+/// Gap from the attacking prime down to the one before it, the only stretch a
+/// piece could interpose in. Distance 2 is handled separately and never reaches
+/// here, since nothing can block it at all.
+#[inline]
+fn block_free_span(d: i64) -> i64 {
+    let mut p = d - 1;
+    while p > 1 {
+        if is_prime_fast(p) {
+            return d - p;
+        }
+        p -= 1;
+    }
+    i64::MAX
+}
+
+/// Primes available to sniper landings, sieved once. Must reach well past
+/// SNIPE_TRIES primes: the candidates start beyond the line's outermost piece,
+/// so the usable window slides upward as pieces spread out.
+static SNIPE_PRIMES: std::sync::LazyLock<Vec<i64>> = std::sync::LazyLock::new(|| {
+    let n = 4096usize;
+    let mut sieve = vec![true; n];
+    let mut out = Vec::with_capacity(600);
+    for i in 2..n {
+        if sieve[i] {
+            out.push(i as i64);
+            let mut j = i * i;
+            while j < n {
+                sieve[j] = false;
+                j += i;
+            }
+        }
+    }
+    out
+});
 
 /// Find the closest blocker at a prime distance for Huygens using spatial indices.
 /// Returns (distance_to_blocker, blocker_color). If no blocker, returns (i64::MAX, None).
@@ -3785,7 +4102,7 @@ fn generate_castling_moves_into(
                 {
                     let mut castling_move =
                         Move::new(*from, Coordinate::new(from.x + dir * 2, from.y), *piece);
-                    castling_move.rook_coord = Some(*coord);
+                    castling_move.partner_coord = Some(*coord);
                     out.push(castling_move);
                 }
             }
@@ -4016,7 +4333,7 @@ mod tests {
         assert_eq!(m.to.x, 3);
         assert_eq!(m.to.y, 4);
         assert!(m.promotion.is_none());
-        assert!(m.rook_coord.is_none());
+        assert!(m.partner_coord.is_none());
     }
 
     #[test]
@@ -4098,6 +4415,42 @@ mod tests {
                     y
                 );
             }
+            reset_world_bounds();
+        });
+    }
+
+    #[test]
+    fn test_knightrider_open_ray_reaches_step_limit() {
+        with_bounds_lock(|| {
+            reset_world_bounds();
+            let mut game = GameState::new();
+            // Lone knightrider with every ray open; kings parked far off its rays.
+            // Piece codes here are the site's two-letter codes (from_site_code);
+            // an unknown code silently becomes a Void, so "Nr" not "S".
+            game.setup_position_from_icn("w Nr0,0|K0,-500|k500,501");
+            assert_eq!(
+                game.board.get_piece(0, 0).map(|p| p.piece_type()),
+                Some(PieceType::Knightrider),
+                "ICN placement precondition"
+            );
+
+            let mut moves = MoveList::new();
+            game.get_pseudo_legal_moves_into(&mut moves);
+            let kr_to = |x: i64, y: i64| {
+                moves
+                    .iter()
+                    .any(|m| m.from.x == 0 && m.from.y == 0 && m.to.x == x && m.to.y == y)
+            };
+
+            // Every hop along an open (1,2) ray out to the step limit.
+            for k in 1..=10 {
+                assert!(
+                    kr_to(k, 2 * k),
+                    "open knightrider ray should reach hop {k} at ({k},{})",
+                    2 * k
+                );
+            }
+            assert!(!kr_to(11, 22), "and stop at the step limit");
             reset_world_bounds();
         });
     }
@@ -4567,6 +4920,46 @@ mod tests {
     }
 
     #[test]
+    fn far_escape_is_generated_once_and_stays_tt_encodable() {
+        use crate::search::tt_defs::{MAX_TT_COORD, MIN_TT_COORD};
+        with_bounds_lock(|| {
+            // Omega^1 showcase: without the far escape the rook on 0,0 reaches
+            // only 0,5, so the search reports a mate that does not exist.
+            let icn = "b 1 -9223372036854773809,9223372036854773809,-9223372036854773811,9223372036854773811 r-2,4|r2,4|r-2,2|r2,2|r-2,0|r0,0|r2,0|k0,-1|R1,-2|P-2,-3|Q-1,-3|P2,-3|K0,-4";
+            let mut game = GameState::new();
+            game.setup_position_from_icn(icn);
+
+            let ups: Vec<_> = game
+                .get_pseudo_legal_moves()
+                .into_iter()
+                .filter(|m| m.from.x == 0 && m.from.y == 0 && m.to.x == 0 && m.to.y >= 50)
+                .collect();
+            assert_eq!(ups.len(), 1, "exactly one far escape up the open ray");
+            let far = ups[0].to;
+            assert!(
+                far.y <= MAX_TT_COORD && far.y >= MIN_TT_COORD,
+                "far escape must encode into a TT move: {far:?}"
+            );
+
+            // From the shell the anchor yields zero room, so there is no second,
+            // farther escape - this is what keeps the branching bounded.
+            let mut game2 = GameState::new();
+            game2.setup_position_from_icn(icn);
+            let undo = game2.make_move(&ups[0]);
+            assert!(
+                !game2
+                    .get_pseudo_legal_moves()
+                    .iter()
+                    .any(|m| m.from == far && m.to.x == 0 && m.to.y > far.y),
+                "no farther escape may be generated from the shell"
+            );
+            game2.undo_move(&ups[0], undo);
+
+            reset_world_bounds();
+        });
+    }
+
+    #[test]
     fn test_generate_rose_moves() {
         with_bounds_lock(|| {
             reset_world_bounds();
@@ -4600,7 +4993,7 @@ mod tests {
                 pinned: &FxHashMap::default(),
             };
 
-            let moves = get_legal_moves(&game.board, PlayerColor::White, &ctx);
+            let moves = get_pseudo_legal_moves(&game.board, PlayerColor::White, &ctx);
 
             assert!(!moves.is_empty(), "White should have legal moves");
             reset_world_bounds();
@@ -4703,7 +5096,7 @@ mod tests {
                 pinned: &FxHashMap::default(),
             };
 
-            let moves = get_legal_moves(&game.board, PlayerColor::White, &ctx);
+            let moves = get_pseudo_legal_moves(&game.board, PlayerColor::White, &ctx);
 
             let target_from = Coordinate::new(10, -30);
             let target_to = Coordinate::new(77, -30);
@@ -4755,6 +5148,82 @@ mod tests {
 
     mod border_handling_tests {
         use super::*;
+
+        #[test]
+        fn rider_generation_emits_no_duplicates() {
+            // Sniper landings and check rides add moves other passes could also
+            // produce, so a duplicate would silently double count in search.
+            use std::collections::HashSet;
+            for (rider, kx, ky) in [(PieceType::Huygen, 40i64, 0i64)] {
+                let mut board = Board::new();
+                board.set_piece(0, 0, Piece::new(rider, PlayerColor::White));
+                board.set_piece(kx, ky, Piece::new(PieceType::King, PlayerColor::Black));
+                board.set_piece(6, 0, Piece::new(PieceType::Pawn, PlayerColor::Black));
+                board.set_piece(12, 0, Piece::new(PieceType::Pawn, PlayerColor::Black));
+                board.set_piece(0, 9, Piece::new(PieceType::Pawn, PlayerColor::Black));
+
+                let indices = SpatialIndices::new(&board);
+                let from = Coordinate::new(0, 0);
+                let piece = Piece::new(rider, PlayerColor::White);
+                let mut out = MoveList::new();
+                match rider {
+                    PieceType::Huygen => generate_huygen_moves_into(
+                        &board,
+                        &from,
+                        &piece,
+                        &indices,
+                        MoveGenType::All,
+                        &mut out,
+                    ),
+                    _ => generate_knightrider_moves_into(
+                        &board,
+                        &from,
+                        &piece,
+                        MoveGenType::All,
+                        &mut out,
+                    ),
+                }
+
+                let mut seen = HashSet::new();
+                for m in out.iter() {
+                    assert!(
+                        seen.insert((m.to.x, m.to.y)),
+                        "{rider:?} generated {:?} twice",
+                        (m.to.x, m.to.y)
+                    );
+                }
+            }
+        }
+
+        /// A huygen hops over composite distances, so landing a prime step past a
+        /// target makes that target its first prime-distance piece: attacked next
+        /// move, with nothing able to interpose.
+        #[test]
+        fn huygen_generates_a_sniper_landing() {
+            let mut board = Board::new();
+            board.set_piece(0, 0, Piece::new(PieceType::Huygen, PlayerColor::White));
+            // Offset 9 is composite, so it never blocks and the ray stays open.
+            board.set_piece(9, 0, Piece::new(PieceType::Pawn, PlayerColor::Black));
+
+            let indices = SpatialIndices::new(&board);
+            let from = Coordinate::new(0, 0);
+            let piece = Piece::new(PieceType::Huygen, PlayerColor::White);
+            let mut out = MoveList::new();
+            generate_huygen_moves_into(
+                &board,
+                &from,
+                &piece,
+                &indices,
+                MoveGenType::All,
+                &mut out,
+            );
+
+            // 11 is prime so reachable, and sits 2 from the pawn: also prime.
+            assert!(
+                out.iter().any(|m| m.to.x == 11 && m.to.y == 0),
+                "expected the landing that attacks the pawn at 9"
+            );
+        }
 
         #[test]
         fn test_huygen_border_respect() {
@@ -4835,6 +5304,66 @@ mod tests {
 
                 super::reset_world_bounds();
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod snipe_coverage_probe {
+    use super::*;
+    use crate::game::GameState;
+
+    #[test]
+    fn probe_huygen_snipe_coverage() {
+        let icn = "w 0/100 1 (4|-4;gu,r,hu,ha) 0,0,_,_ P0,-3+|P0,-4+|GU0,-6|R0,-7|K0,-8|HA0,-10|HA0,-11|HU0,-13|HU0,-14|p0,4+|p0,3+|gu0,6|r0,7|k0,8|ha0,10|ha0,11|hu0,14|hu0,13";
+        let mut game = GameState::new();
+        game.setup_position_from_icn(icn);
+        game.recompute_piece_counts();
+        game.recompute_hash();
+
+        let moves = game.get_pseudo_legal_moves();
+        let enemies: Vec<i64> = vec![4, 3, 6, 7, 8, 10, 11, 14, 13];
+        let mut covered = 0;
+        let mut per_target_count: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        for m in moves.iter().filter(|m| m.piece.piece_type() == PieceType::Huygen && m.from.x == 0) {
+            *per_target_count.entry(m.to.y).or_insert(0) += 1;
+        }
+        for &ey in &enemies {
+            let hit = moves.iter().any(|m| {
+                if m.piece.piece_type() != PieceType::Huygen || m.from.x != 0 {
+                    return false;
+                }
+                let mut best: Option<(i64, i64)> = None;
+                for (_, y, _) in game.board.iter().filter(|(x, _, _)| *x == 0) {
+                    if y == m.from.y {
+                        continue;
+                    }
+                    let d = (m.to.y - y).abs();
+                    if d > 0 && crate::utils::is_prime_fast(d) && best.is_none_or(|(bd, _)| d < bd) {
+                        best = Some((d, y));
+                    }
+                }
+                best.map(|(_, y)| y) == Some(ey)
+            });
+            if hit {
+                covered += 1;
+            } else {
+                println!("  NOT attacked: enemy at y={}", ey);
+            }
+        }
+        println!("HUYGEN SNIPE COVERAGE: {}/{} enemies attackable, total huygen moves = {}",
+            covered, enemies.len(),
+            moves.iter().filter(|m| m.piece.piece_type() == PieceType::Huygen).count());
+        for (y, m) in moves.iter()
+            .filter(|m| m.piece.piece_type() == PieceType::Huygen && m.from.x == 0)
+            .map(|m| m.to.y)
+            .fold(std::collections::HashMap::<i64, usize>::new(), |mut acc, y| {
+                *acc.entry(y).or_insert(0) += 1;
+                acc
+            })
+            .into_iter()
+        {
+            let _ = m;
         }
     }
 }

@@ -273,7 +273,7 @@ impl StagedMoveGen {
     /// move fails pseudo-legality and is then skipped as already-tried when generation
     /// produces it. Rebuild the partner by the same nearest-eligible rule.
     fn reconstruct_castling_partner(game: &GameState, mut m: Move) -> Move {
-        if m.rook_coord.is_some() || !m.piece.piece_type().is_royal() {
+        if m.partner_coord.is_some() || !m.piece.piece_type().is_royal() {
             return m;
         }
         let dx = m.to.x - m.from.x;
@@ -291,7 +291,7 @@ impl StagedMoveGen {
                 && !partner.piece_type().is_royal()
                 && game.special_rights.contains(&partner_coord)
             {
-                m.rook_coord = Some(partner_coord);
+                m.partner_coord = Some(partner_coord);
             }
         }
         m
@@ -353,6 +353,31 @@ impl StagedMoveGen {
             let target = crate::board::Piece::from_packed(target_packed);
             if target.color() == game.turn {
                 return false;
+            }
+        }
+
+        // Castling belongs to any royal with rights paired with any non-pawn that
+        // has them, not to the king alone.
+        if piece.piece_type().is_royal() {
+            let dx = m.to.x - m.from.x;
+            if m.to.y == m.from.y && dx.abs() > 1 {
+                let Some(partner) = &m.partner_coord else {
+                    return false;
+                };
+                if !game
+                    .board
+                    .is_occupied_by_color(partner.x, partner.y, game.turn)
+                {
+                    return false;
+                }
+                let dir = if dx > 0 { 1 } else { -1 };
+                if game.board.is_occupied(m.from.x + dir, m.from.y)
+                    || game.board.is_occupied(m.to.x, m.from.y)
+                    || (dir < 0 && game.board.is_occupied(m.from.x - 3, m.from.y))
+                {
+                    return false;
+                }
+                return true;
             }
         }
 
@@ -419,26 +444,6 @@ impl StagedMoveGen {
             PieceType::King => {
                 let dx = (m.to.x - m.from.x).abs();
                 let dy = (m.to.y - m.from.y).abs();
-
-                if dx > 1 {
-                    if let Some(rook_coord) = &m.rook_coord {
-                        if !game
-                            .board
-                            .is_occupied_by_color(rook_coord.x, rook_coord.y, game.turn)
-                        {
-                            return false;
-                        }
-                        let dir = if m.to.x > m.from.x { 1 } else { -1 };
-                        if game.board.is_occupied(m.from.x + dir, m.from.y)
-                            || game.board.is_occupied(m.to.x, m.from.y)
-                            || (dir < 0 && game.board.is_occupied(m.from.x - 3, m.from.y))
-                        {
-                            return false;
-                        }
-                        return true;
-                    }
-                    return false;
-                }
                 dx <= 1 && dy <= 1
             }
             PieceType::Rook | PieceType::Bishop | PieceType::Queen => {
@@ -548,6 +553,13 @@ impl StagedMoveGen {
             && m.promotion == k2.promotion
         {
             return sort_killer2();
+        }
+
+        // A run to the far shell is a last resort, so it belongs behind every other
+        // quiet: full-width searching it costs ~20% nodes, and returning here also
+        // skips the attack scan below for a move that almost never attacks anything.
+        if crate::moves::is_far_escape_move(m) {
+            return GOOD_QUIET_THRESHOLD - 1;
         }
 
         // Countermove bonus
@@ -1169,7 +1181,7 @@ mod tests {
     }
 
     fn find_move(game: &GameState, from: (i64, i64), to: (i64, i64)) -> Move {
-        game.get_legal_moves()
+        game.get_pseudo_legal_moves()
             .into_iter()
             .find(|m| m.from.x == from.0 && m.from.y == from.1 && m.to.x == to.0 && m.to.y == to.1)
             .unwrap()
@@ -1221,7 +1233,7 @@ mod tests {
 
         let castle_game = game_from_icn("w 0/100 1 (8;q|1;q) K5,1+|R8,1+|k5,8");
         let castle = castle_game
-            .get_legal_moves()
+            .get_pseudo_legal_moves()
             .into_iter()
             .find(|m| m.piece.piece_type() == PieceType::King && (m.to.x - m.from.x).abs() > 1)
             .unwrap();
@@ -1284,23 +1296,23 @@ mod tests {
     }
 
     #[test]
-    fn tt_castling_move_survives_missing_rook_coord() {
+    fn tt_castling_move_survives_missing_partner_coord() {
         // King e1 and rook h1 both retain rights; kingside castling is legal.
         let game = game_from_icn("w 0/100 1 (8;q|1;q) K5,1+|R8,1+|k5,8");
 
         let castle = game
-            .get_legal_moves()
+            .get_pseudo_legal_moves()
             .into_iter()
             .find(|m| m.piece.piece_type() == PieceType::King && (m.to.x - m.from.x).abs() == 2)
             .expect("kingside castling should be legal");
         assert!(
-            castle.rook_coord.is_some(),
+            castle.partner_coord.is_some(),
             "generated castling has a partner"
         );
 
         // Simulate the TT/killer round-trip, which drops the rook partner.
         let tt_decoded = Move {
-            rook_coord: None,
+            partner_coord: None,
             ..castle
         };
 
@@ -1312,7 +1324,7 @@ mod tests {
             if m.from == castle.from && m.to == castle.to {
                 found = true;
                 assert!(
-                    m.rook_coord.is_some(),
+                    m.partner_coord.is_some(),
                     "emitted castling move lost its rook partner"
                 );
             }

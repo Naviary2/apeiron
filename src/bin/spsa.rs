@@ -293,7 +293,7 @@ fn piece_value_names() -> &'static [&'static str] {
         "rook",
         "guard",
         "centaur",
-        "compound_bonus",
+        "queen",
         "camel",
         "giraffe",
         "zebra",
@@ -302,7 +302,8 @@ fn piece_value_names() -> &'static [&'static str] {
         "archbishop",
         "rose",
         "huygen",
-        "chancellor_bonus",
+        "chancellor",
+        "amazon",
     ]
 }
 
@@ -413,7 +414,7 @@ fn parse_bestmove_to_icn(bestmove_str: &str, turn: PlayerColor) -> Option<String
 }
 
 fn has_any_fully_legal_move(game: &mut GameState) -> bool {
-    for m in game.get_legal_moves() {
+    for m in game.get_pseudo_legal_moves() {
         let undo = game.make_move(&m);
         let legal = !game.is_move_illegal();
         game.undo_move(&m, undo);

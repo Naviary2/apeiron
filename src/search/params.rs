@@ -77,7 +77,7 @@ pub const DEFAULT_HLP_MIN_MOVES: usize = 4;
 pub const DEFAULT_HLP_HISTORY_REDUCE: i32 = 300;
 pub const DEFAULT_HLP_HISTORY_LEAF: i32 = 0;
 
-pub const DEFAULT_LMP_BASE: usize = 2;
+pub const DEFAULT_LMP_BASE: usize = 3;
 pub const DEFAULT_LMP_DEPTH_MULT: usize = 1;
 
 pub const DEFAULT_ASPIRATION_WINDOW: i32 = 60;
@@ -167,7 +167,7 @@ pub const TUNABLE_EVAL_PARAM_SPECS: &[EvalParamSpec] = &[
     EvalParamSpec::new("rook", crate::evaluation::base::DEFAULT_EVAL_ROOK as i64, 450, 850, 6.0, 0.002, "Rook value"),
     EvalParamSpec::new("guard", crate::evaluation::base::DEFAULT_EVAL_GUARD as i64, 120, 420, 4.0, 0.002, "Guard value"),
     EvalParamSpec::new("centaur", crate::evaluation::base::DEFAULT_EVAL_CENTAUR as i64, 350, 750, 6.0, 0.002, "Centaur value"),
-    EvalParamSpec::new("compound_bonus", crate::evaluation::base::DEFAULT_EVAL_COMPOUND_BONUS as i64, 0, 250, 4.0, 0.002, "Compound piece bonus"),
+    EvalParamSpec::new("queen", crate::evaluation::base::DEFAULT_EVAL_QUEEN as i64, 700, 2100, 4.0, 0.002, "Queen value"),
     EvalParamSpec::new("camel", crate::evaluation::base::DEFAULT_EVAL_CAMEL as i64, 120, 470, 4.0, 0.002, "Camel value"),
     EvalParamSpec::new("giraffe", crate::evaluation::base::DEFAULT_EVAL_GIRAFFE as i64, 120, 460, 4.0, 0.002, "Giraffe value"),
     EvalParamSpec::new("zebra", crate::evaluation::base::DEFAULT_EVAL_ZEBRA as i64, 120, 460, 4.0, 0.002, "Zebra value"),
@@ -176,7 +176,7 @@ pub const TUNABLE_EVAL_PARAM_SPECS: &[EvalParamSpec] = &[
     EvalParamSpec::new("archbishop", crate::evaluation::base::DEFAULT_EVAL_ARCHBISHOP as i64, 700, 1100, 8.0, 0.002, "Archbishop value"),
     EvalParamSpec::new("rose", crate::evaluation::base::DEFAULT_EVAL_ROSE as i64, 700, 1250, 6.0, 0.002, "Rose value"),
     EvalParamSpec::new("huygen", crate::evaluation::base::DEFAULT_EVAL_HUYGEN as i64, 155, 555, 4.0, 0.002, "Huygen value"),
-    EvalParamSpec::new("chancellor_bonus", crate::evaluation::base::DEFAULT_EVAL_CHANCELLOR_BONUS as i64, 0, 300, 4.0, 0.002, "Chancellor extra value bonus"),
+    EvalParamSpec::new("chancellor", crate::evaluation::base::DEFAULT_EVAL_CHANCELLOR as i64, 600, 1900, 4.0, 0.002, "Chancellor value"),
     EvalParamSpec::new("mg_doubled_pawn_penalty", crate::evaluation::base::DEFAULT_EVAL_MG_DOUBLED_PAWN_PENALTY as i64, 0, 208, 2.0, 0.002, "Middlegame doubled pawn penalty"),
     EvalParamSpec::new("eg_doubled_pawn_penalty", crate::evaluation::base::DEFAULT_EVAL_EG_DOUBLED_PAWN_PENALTY as i64, 0, 212, 2.0, 0.002, "Endgame doubled pawn penalty"),
     EvalParamSpec::new("mg_bishop_pair_bonus", crate::evaluation::base::DEFAULT_EVAL_MG_BISHOP_PAIR_BONUS as i64, 0, 260, 2.0, 0.002, "Middlegame bishop pair bonus"),
@@ -203,7 +203,7 @@ pub const TUNABLE_EVAL_PARAM_SPECS: &[EvalParamSpec] = &[
     EvalParamSpec::new("eg_king_defender_bonus", crate::evaluation::base::DEFAULT_EVAL_EG_KING_DEFENDER_BONUS as i64, 0, 50, 2.0, 0.002, "Endgame king defender bonus"),
     EvalParamSpec::new("mg_outpost_bonus", crate::evaluation::base::DEFAULT_EVAL_MG_OUTPOST_BONUS as i64, 0, 220, 2.0, 0.002, "Middlegame outpost bonus"),
     EvalParamSpec::new("eg_outpost_bonus", crate::evaluation::base::DEFAULT_EVAL_EG_OUTPOST_BONUS as i64, 0, 250, 2.0, 0.002, "Endgame outpost bonus"),
-    EvalParamSpec::new("amazon_compound_bonus", crate::evaluation::base::DEFAULT_EVAL_AMAZON_COMPOUND_BONUS as i64, 0, 500, 4.0, 0.002, "Amazon compound-piece bonus"),
+    EvalParamSpec::new("amazon", crate::evaluation::base::DEFAULT_EVAL_AMAZON as i64, 900, 2800, 4.0, 0.002, "Amazon value"),
     EvalParamSpec::new("slider_net_bonus", crate::evaluation::base::DEFAULT_EVAL_SLIDER_NET_BONUS as i64, 0, 80, 2.0, 0.002, "Slider net-control bonus"),
     EvalParamSpec::new("far_slider_cheb_radius", crate::evaluation::base::DEFAULT_EVAL_FAR_SLIDER_CHEB_RADIUS as i64, 6, 40, 2.0, 0.002, "Chebyshev radius beyond which a slider is far from the action"),
     EvalParamSpec::new("far_slider_cheb_max_excess", crate::evaluation::base::DEFAULT_EVAL_FAR_SLIDER_CHEB_MAX_EXCESS as i64, 10, 100, 2.0, 0.002, "Max excess distance counted for the far-slider penalty"),
@@ -212,6 +212,8 @@ pub const TUNABLE_EVAL_PARAM_SPECS: &[EvalParamSpec] = &[
     EvalParamSpec::new("piece_cloud_cheb_radius", crate::evaluation::base::DEFAULT_EVAL_PIECE_CLOUD_CHEB_RADIUS as i64, 4, 40, 2.0, 0.002, "Chebyshev radius of the piece-cloud cohesion zone"),
     EvalParamSpec::new("slider_axis_wiggle", crate::evaluation::base::DEFAULT_EVAL_SLIDER_AXIS_WIGGLE as i64, 1, 20, 2.0, 0.002, "Wiggle room for a slider ray to count as passing through center"),
     EvalParamSpec::new("piece_cloud_cheb_max_excess", crate::evaluation::base::DEFAULT_EVAL_PIECE_CLOUD_CHEB_MAX_EXCESS as i64, 16, 160, 2.0, 0.002, "Max excess distance counted for the piece-cloud penalty"),
+    EvalParamSpec::new("centrality_value_scale", crate::evaluation::base::DEFAULT_EVAL_CENTRALITY_VALUE_SCALE as i64, 20, 200, 4.0, 0.002, "Cloud-centre weight as a percent of piece value"),
+    EvalParamSpec::new("cloud_penalty_max_pct", crate::evaluation::base::DEFAULT_EVAL_CLOUD_PENALTY_MAX_PCT as i64, 10, 130, 4.0, 0.002, "Cloud penalty ceiling, as a percent of the piece's value"),
     EvalParamSpec::new("cloud_penalty_per_100_value", crate::evaluation::base::DEFAULT_EVAL_CLOUD_PENALTY_PER_100_VALUE as i64, 0, 6, 2.0, 0.002, "Cloud-spread penalty per 100 value of piece worth"),
     EvalParamSpec::new("cloud_center_max_skew_dist", crate::evaluation::base::DEFAULT_EVAL_CLOUD_CENTER_MAX_SKEW_DIST as i64, 4, 40, 2.0, 0.002, "Max skew distance for the cloud-center reference point"),
     EvalParamSpec::new("queen_ideal_line_dist", crate::evaluation::base::DEFAULT_EVAL_QUEEN_IDEAL_LINE_DIST as i64, 1, 16, 2.0, 0.002, "Ideal file/rank distance for queen line pressure"),
@@ -223,11 +225,12 @@ pub const TUNABLE_EVAL_PARAM_SPECS: &[EvalParamSpec] = &[
     EvalParamSpec::new("centaur_guard_scale", crate::evaluation::base::DEFAULT_EVAL_CENTAUR_GUARD_SCALE as i64, 10, 120, 2.0, 0.002, "Centaur guard/leaper-component scale (% of guard eval)"),
     EvalParamSpec::new("pawn_full_value_threshold", crate::evaluation::base::DEFAULT_EVAL_PAWN_FULL_VALUE_THRESHOLD as i64, 2, 16, 2.0, 0.002, "Ranks from promotion within which a pawn keeps full value"),
     EvalParamSpec::new("pawn_past_promo_penalty", crate::evaluation::base::DEFAULT_EVAL_PAWN_PAST_PROMO_PENALTY as i64, 0, 250, 2.0, 0.002, "Penalty for a pawn that can never promote"),
-    EvalParamSpec::new("pawn_far_from_promo_penalty", crate::evaluation::base::DEFAULT_EVAL_PAWN_FAR_FROM_PROMO_PENALTY as i64, 0, 150, 2.0, 0.002, "Flat penalty for a pawn far from promotion"),
+    EvalParamSpec::new("pawn_far_from_promo_max_penalty", crate::evaluation::base::DEFAULT_EVAL_PAWN_FAR_FROM_PROMO_MAX_PENALTY as i64, 0, 150, 2.0, 0.002, "Max penalty for a pawn far from promotion"),
     EvalParamSpec::new("minor_development_penalty_threshold", crate::evaluation::base::DEFAULT_EVAL_MINOR_DEVELOPMENT_PENALTY_THRESHOLD as i64, 100, 800, 4.0, 0.002, "Piece value below which the stronger undeveloped-minor penalty applies"),
     EvalParamSpec::new("min_major_development_penalty", crate::evaluation::base::DEFAULT_EVAL_MIN_MAJOR_DEVELOPMENT_PENALTY as i64, 0, 30, 2.0, 0.002, "Undeveloped-major penalty"),
     EvalParamSpec::new("min_fairy_development_penalty", crate::evaluation::base::DEFAULT_EVAL_MIN_FAIRY_DEVELOPMENT_PENALTY as i64, 0, 220, 2.0, 0.002, "Undeveloped-fairy-leaper penalty (leapers are worthless at home, knights and bishops are not)"),
-    EvalParamSpec::new("king_defender_value_threshold", crate::evaluation::base::DEFAULT_EVAL_KING_DEFENDER_VALUE_THRESHOLD as i64, 100, 800, 4.0, 0.002, "Piece value below which a piece counts as a king defender"),
+    EvalParamSpec::new("tied_defender_ref_value", crate::evaluation::base::DEFAULT_EVAL_TIED_DEFENDER_REF_VALUE as i64, 150, 1600, 8.0, 0.002, "Reference value at which a king-tied piece pays the full penalty"),
+    EvalParamSpec::new("king_defender_ref_value", crate::evaluation::base::DEFAULT_EVAL_KING_DEFENDER_REF_VALUE as i64, 100, 800, 4.0, 0.002, "Piece value below which a piece counts as a king defender"),
     EvalParamSpec::new("complexity_damp", crate::evaluation::base::DEFAULT_EVAL_COMPLEXITY_DAMP as i64, 0, 40, 2.0, 0.002, "Per-excess-phase damping applied to the whole score"),
     EvalParamSpec::new("complexity_excess_max", crate::evaluation::base::DEFAULT_EVAL_COMPLEXITY_EXCESS_MAX as i64, 8, 100, 2.0, 0.002, "Cap on phase excess counted for complexity damping"),
     EvalParamSpec::new("king_shield_ahead_max_dist", crate::evaluation::base::DEFAULT_EVAL_KING_SHIELD_AHEAD_MAX_DIST as i64, 1, 10, 2.0, 0.002, "Max distance ahead of the king counted for pawn shield"),
@@ -303,7 +306,7 @@ pub struct EvalParams {
     pub rook: i32,
     pub guard: i32,
     pub centaur: i32,
-    pub compound_bonus: i32,
+    pub queen: i32,
     pub camel: i32,
     pub giraffe: i32,
     pub zebra: i32,
@@ -312,7 +315,7 @@ pub struct EvalParams {
     pub archbishop: i32,
     pub rose: i32,
     pub huygen: i32,
-    pub chancellor_bonus: i32,
+    pub chancellor: i32,
     pub mg_doubled_pawn_penalty: i32,
     pub eg_doubled_pawn_penalty: i32,
     pub mg_bishop_pair_bonus: i32,
@@ -339,7 +342,7 @@ pub struct EvalParams {
     pub eg_king_defender_bonus: i32,
     pub mg_outpost_bonus: i32,
     pub eg_outpost_bonus: i32,
-    pub amazon_compound_bonus: i32,
+    pub amazon: i32,
     pub slider_net_bonus: i32,
     pub far_slider_cheb_radius: i32,
     pub far_slider_cheb_max_excess: i32,
@@ -349,6 +352,8 @@ pub struct EvalParams {
     pub slider_axis_wiggle: i32,
     pub piece_cloud_cheb_max_excess: i32,
     pub cloud_penalty_per_100_value: i32,
+    pub cloud_penalty_max_pct: i32,
+    pub centrality_value_scale: i32,
     pub cloud_center_max_skew_dist: i32,
     pub queen_ideal_line_dist: i32,
     pub leaper_tropism_divisor: i32,
@@ -359,11 +364,12 @@ pub struct EvalParams {
     pub centaur_guard_scale: i32,
     pub pawn_full_value_threshold: i32,
     pub pawn_past_promo_penalty: i32,
-    pub pawn_far_from_promo_penalty: i32,
+    pub pawn_far_from_promo_max_penalty: i32,
     pub minor_development_penalty_threshold: i32,
     pub min_major_development_penalty: i32,
     pub min_fairy_development_penalty: i32,
-    pub king_defender_value_threshold: i32,
+    pub king_defender_ref_value: i32,
+    pub tied_defender_ref_value: i32,
     pub complexity_damp: i32,
     pub complexity_excess_max: i32,
     pub king_shield_ahead_max_dist: i32,
@@ -439,7 +445,7 @@ impl Default for EvalParams {
             rook: crate::evaluation::base::DEFAULT_EVAL_ROOK,
             guard: crate::evaluation::base::DEFAULT_EVAL_GUARD,
             centaur: crate::evaluation::base::DEFAULT_EVAL_CENTAUR,
-            compound_bonus: crate::evaluation::base::DEFAULT_EVAL_COMPOUND_BONUS,
+            queen: crate::evaluation::base::DEFAULT_EVAL_QUEEN,
             camel: crate::evaluation::base::DEFAULT_EVAL_CAMEL,
             giraffe: crate::evaluation::base::DEFAULT_EVAL_GIRAFFE,
             zebra: crate::evaluation::base::DEFAULT_EVAL_ZEBRA,
@@ -448,7 +454,7 @@ impl Default for EvalParams {
             archbishop: crate::evaluation::base::DEFAULT_EVAL_ARCHBISHOP,
             rose: crate::evaluation::base::DEFAULT_EVAL_ROSE,
             huygen: crate::evaluation::base::DEFAULT_EVAL_HUYGEN,
-            chancellor_bonus: crate::evaluation::base::DEFAULT_EVAL_CHANCELLOR_BONUS,
+            chancellor: crate::evaluation::base::DEFAULT_EVAL_CHANCELLOR,
             mg_doubled_pawn_penalty: crate::evaluation::base::DEFAULT_EVAL_MG_DOUBLED_PAWN_PENALTY,
             eg_doubled_pawn_penalty: crate::evaluation::base::DEFAULT_EVAL_EG_DOUBLED_PAWN_PENALTY,
             mg_bishop_pair_bonus: crate::evaluation::base::DEFAULT_EVAL_MG_BISHOP_PAIR_BONUS,
@@ -477,7 +483,7 @@ impl Default for EvalParams {
             eg_king_defender_bonus: crate::evaluation::base::DEFAULT_EVAL_EG_KING_DEFENDER_BONUS,
             mg_outpost_bonus: crate::evaluation::base::DEFAULT_EVAL_MG_OUTPOST_BONUS,
             eg_outpost_bonus: crate::evaluation::base::DEFAULT_EVAL_EG_OUTPOST_BONUS,
-            amazon_compound_bonus: crate::evaluation::base::DEFAULT_EVAL_AMAZON_COMPOUND_BONUS,
+            amazon: crate::evaluation::base::DEFAULT_EVAL_AMAZON,
             slider_net_bonus: crate::evaluation::base::DEFAULT_EVAL_SLIDER_NET_BONUS,
             far_slider_cheb_radius: crate::evaluation::base::DEFAULT_EVAL_FAR_SLIDER_CHEB_RADIUS,
             far_slider_cheb_max_excess: crate::evaluation::base::DEFAULT_EVAL_FAR_SLIDER_CHEB_MAX_EXCESS,
@@ -487,6 +493,8 @@ impl Default for EvalParams {
             slider_axis_wiggle: crate::evaluation::base::DEFAULT_EVAL_SLIDER_AXIS_WIGGLE,
             piece_cloud_cheb_max_excess: crate::evaluation::base::DEFAULT_EVAL_PIECE_CLOUD_CHEB_MAX_EXCESS,
             cloud_penalty_per_100_value: crate::evaluation::base::DEFAULT_EVAL_CLOUD_PENALTY_PER_100_VALUE,
+            cloud_penalty_max_pct: crate::evaluation::base::DEFAULT_EVAL_CLOUD_PENALTY_MAX_PCT,
+            centrality_value_scale: crate::evaluation::base::DEFAULT_EVAL_CENTRALITY_VALUE_SCALE,
             cloud_center_max_skew_dist: crate::evaluation::base::DEFAULT_EVAL_CLOUD_CENTER_MAX_SKEW_DIST,
             queen_ideal_line_dist: crate::evaluation::base::DEFAULT_EVAL_QUEEN_IDEAL_LINE_DIST,
             leaper_tropism_divisor: crate::evaluation::base::DEFAULT_EVAL_LEAPER_TROPISM_DIVISOR,
@@ -497,11 +505,12 @@ impl Default for EvalParams {
             centaur_guard_scale: crate::evaluation::base::DEFAULT_EVAL_CENTAUR_GUARD_SCALE,
             pawn_full_value_threshold: crate::evaluation::base::DEFAULT_EVAL_PAWN_FULL_VALUE_THRESHOLD,
             pawn_past_promo_penalty: crate::evaluation::base::DEFAULT_EVAL_PAWN_PAST_PROMO_PENALTY,
-            pawn_far_from_promo_penalty: crate::evaluation::base::DEFAULT_EVAL_PAWN_FAR_FROM_PROMO_PENALTY,
+            pawn_far_from_promo_max_penalty: crate::evaluation::base::DEFAULT_EVAL_PAWN_FAR_FROM_PROMO_MAX_PENALTY,
             minor_development_penalty_threshold: crate::evaluation::base::DEFAULT_EVAL_MINOR_DEVELOPMENT_PENALTY_THRESHOLD,
             min_major_development_penalty: crate::evaluation::base::DEFAULT_EVAL_MIN_MAJOR_DEVELOPMENT_PENALTY,
             min_fairy_development_penalty: crate::evaluation::base::DEFAULT_EVAL_MIN_FAIRY_DEVELOPMENT_PENALTY,
-            king_defender_value_threshold: crate::evaluation::base::DEFAULT_EVAL_KING_DEFENDER_VALUE_THRESHOLD,
+            king_defender_ref_value: crate::evaluation::base::DEFAULT_EVAL_KING_DEFENDER_REF_VALUE,
+            tied_defender_ref_value: crate::evaluation::base::DEFAULT_EVAL_TIED_DEFENDER_REF_VALUE,
             complexity_damp: crate::evaluation::base::DEFAULT_EVAL_COMPLEXITY_DAMP,
             complexity_excess_max: crate::evaluation::base::DEFAULT_EVAL_COMPLEXITY_EXCESS_MAX,
             king_shield_ahead_max_dist: crate::evaluation::base::DEFAULT_EVAL_KING_SHIELD_AHEAD_MAX_DIST,
@@ -657,10 +666,7 @@ define_eval_accessor!(bishop, crate::evaluation::base::DEFAULT_EVAL_BISHOP);
 define_eval_accessor!(rook, crate::evaluation::base::DEFAULT_EVAL_ROOK);
 define_eval_accessor!(guard, crate::evaluation::base::DEFAULT_EVAL_GUARD);
 define_eval_accessor!(centaur, crate::evaluation::base::DEFAULT_EVAL_CENTAUR);
-define_eval_accessor!(
-    compound_bonus,
-    crate::evaluation::base::DEFAULT_EVAL_COMPOUND_BONUS
-);
+define_eval_accessor!(queen, crate::evaluation::base::DEFAULT_EVAL_QUEEN);
 define_eval_accessor!(camel, crate::evaluation::base::DEFAULT_EVAL_CAMEL);
 define_eval_accessor!(giraffe, crate::evaluation::base::DEFAULT_EVAL_GIRAFFE);
 define_eval_accessor!(zebra, crate::evaluation::base::DEFAULT_EVAL_ZEBRA);
@@ -672,10 +678,7 @@ define_eval_accessor!(hawk, crate::evaluation::base::DEFAULT_EVAL_HAWK);
 define_eval_accessor!(archbishop, crate::evaluation::base::DEFAULT_EVAL_ARCHBISHOP);
 define_eval_accessor!(rose, crate::evaluation::base::DEFAULT_EVAL_ROSE);
 define_eval_accessor!(huygen, crate::evaluation::base::DEFAULT_EVAL_HUYGEN);
-define_eval_accessor!(
-    chancellor_bonus,
-    crate::evaluation::base::DEFAULT_EVAL_CHANCELLOR_BONUS
-);
+define_eval_accessor!(chancellor, crate::evaluation::base::DEFAULT_EVAL_CHANCELLOR);
 define_eval_accessor!(
     mg_doubled_pawn_penalty,
     crate::evaluation::base::DEFAULT_EVAL_MG_DOUBLED_PAWN_PENALTY
@@ -780,7 +783,7 @@ define_eval_accessor!(
     eg_outpost_bonus,
     crate::evaluation::base::DEFAULT_EVAL_EG_OUTPOST_BONUS
 );
-define_eval_accessor!(amazon_compound_bonus, crate::evaluation::base::DEFAULT_EVAL_AMAZON_COMPOUND_BONUS);
+define_eval_accessor!(amazon, crate::evaluation::base::DEFAULT_EVAL_AMAZON);
 define_eval_accessor!(slider_net_bonus, crate::evaluation::base::DEFAULT_EVAL_SLIDER_NET_BONUS);
 define_eval_accessor!(far_slider_cheb_radius, crate::evaluation::base::DEFAULT_EVAL_FAR_SLIDER_CHEB_RADIUS);
 define_eval_accessor!(far_slider_cheb_max_excess, crate::evaluation::base::DEFAULT_EVAL_FAR_SLIDER_CHEB_MAX_EXCESS);
@@ -790,6 +793,14 @@ define_eval_accessor!(piece_cloud_cheb_radius, crate::evaluation::base::DEFAULT_
 define_eval_accessor!(slider_axis_wiggle, crate::evaluation::base::DEFAULT_EVAL_SLIDER_AXIS_WIGGLE);
 define_eval_accessor!(piece_cloud_cheb_max_excess, crate::evaluation::base::DEFAULT_EVAL_PIECE_CLOUD_CHEB_MAX_EXCESS);
 define_eval_accessor!(cloud_penalty_per_100_value, crate::evaluation::base::DEFAULT_EVAL_CLOUD_PENALTY_PER_100_VALUE);
+define_eval_accessor!(
+    cloud_penalty_max_pct,
+    crate::evaluation::base::DEFAULT_EVAL_CLOUD_PENALTY_MAX_PCT
+);
+define_eval_accessor!(
+    centrality_value_scale,
+    crate::evaluation::base::DEFAULT_EVAL_CENTRALITY_VALUE_SCALE
+);
 define_eval_accessor!(cloud_center_max_skew_dist, crate::evaluation::base::DEFAULT_EVAL_CLOUD_CENTER_MAX_SKEW_DIST);
 define_eval_accessor!(queen_ideal_line_dist, crate::evaluation::base::DEFAULT_EVAL_QUEEN_IDEAL_LINE_DIST);
 define_eval_accessor!(leaper_tropism_divisor, crate::evaluation::base::DEFAULT_EVAL_LEAPER_TROPISM_DIVISOR);
@@ -800,11 +811,15 @@ define_eval_accessor!(amazon_queen_scale, crate::evaluation::base::DEFAULT_EVAL_
 define_eval_accessor!(centaur_guard_scale, crate::evaluation::base::DEFAULT_EVAL_CENTAUR_GUARD_SCALE);
 define_eval_accessor!(pawn_full_value_threshold, crate::evaluation::base::DEFAULT_EVAL_PAWN_FULL_VALUE_THRESHOLD);
 define_eval_accessor!(pawn_past_promo_penalty, crate::evaluation::base::DEFAULT_EVAL_PAWN_PAST_PROMO_PENALTY);
-define_eval_accessor!(pawn_far_from_promo_penalty, crate::evaluation::base::DEFAULT_EVAL_PAWN_FAR_FROM_PROMO_PENALTY);
+define_eval_accessor!(pawn_far_from_promo_max_penalty, crate::evaluation::base::DEFAULT_EVAL_PAWN_FAR_FROM_PROMO_MAX_PENALTY);
 define_eval_accessor!(minor_development_penalty_threshold, crate::evaluation::base::DEFAULT_EVAL_MINOR_DEVELOPMENT_PENALTY_THRESHOLD);
 define_eval_accessor!(min_major_development_penalty, crate::evaluation::base::DEFAULT_EVAL_MIN_MAJOR_DEVELOPMENT_PENALTY);
 define_eval_accessor!(min_fairy_development_penalty, crate::evaluation::base::DEFAULT_EVAL_MIN_FAIRY_DEVELOPMENT_PENALTY);
-define_eval_accessor!(king_defender_value_threshold, crate::evaluation::base::DEFAULT_EVAL_KING_DEFENDER_VALUE_THRESHOLD);
+define_eval_accessor!(king_defender_ref_value, crate::evaluation::base::DEFAULT_EVAL_KING_DEFENDER_REF_VALUE);
+define_eval_accessor!(
+    tied_defender_ref_value,
+    crate::evaluation::base::DEFAULT_EVAL_TIED_DEFENDER_REF_VALUE
+);
 define_eval_accessor!(complexity_damp, crate::evaluation::base::DEFAULT_EVAL_COMPLEXITY_DAMP);
 define_eval_accessor!(complexity_excess_max, crate::evaluation::base::DEFAULT_EVAL_COMPLEXITY_EXCESS_MAX);
 define_eval_accessor!(king_shield_ahead_max_dist, crate::evaluation::base::DEFAULT_EVAL_KING_SHIELD_AHEAD_MAX_DIST);
@@ -906,11 +921,6 @@ pub fn passed_pawn_adv_bonus() -> [[[i32; 6]; 2]; 2] {
         [passed_pawn_adv_bonus_1_1_0(), passed_pawn_adv_bonus_1_1_1(), passed_pawn_adv_bonus_1_1_2(), passed_pawn_adv_bonus_1_1_3(), passed_pawn_adv_bonus_1_1_4(), passed_pawn_adv_bonus_1_1_5()],
     ],
     ]
-}
-
-#[inline]
-pub fn queen_value() -> i32 {
-    rook() * 2 + compound_bonus()
 }
 
 #[rustfmt::skip]
@@ -1239,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn eval_param_specs_have_valid_ranges_and_queen_value_matches_formula() {
+    fn eval_param_specs_have_valid_ranges() {
         for spec in TUNABLE_EVAL_PARAM_SPECS {
             assert!(spec.min <= spec.max);
             assert_eq!(spec.clamp_value(spec.min - 1000), spec.min);
@@ -1247,6 +1257,5 @@ mod tests {
             assert!((spec.min..=spec.max).contains(&spec.clamp_value(spec.default)));
         }
 
-        assert_eq!(queen_value(), rook() * 2 + compound_bonus());
     }
 }

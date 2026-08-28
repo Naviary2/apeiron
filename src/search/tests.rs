@@ -337,7 +337,7 @@ fn thread_result(
             to: Coordinate::new(to.0, to.1),
             piece: Piece::new(PieceType::Pawn, PlayerColor::White),
             promotion: promo,
-            rook_coord: None,
+            partner_coord: None,
         },
         score,
         completed_depth: depth,
@@ -754,7 +754,6 @@ fn test_tt_integration_via_local() {
     });
     assert!(result.is_some());
     let res = result.unwrap();
-    assert_eq!(res.cutoff_score, score);
     assert!(res.best_move.is_some());
     assert_eq!(res.best_move.unwrap().from.x, 0);
 }
@@ -785,7 +784,7 @@ fn test_search_mate_in_one() {
     game.recompute_hash();
 
     // Verification: ensure move generation works
-    let moves = game.get_legal_moves();
+    let moves = game.get_pseudo_legal_moves();
     assert!(
         !moves.is_empty(),
         "White should have legal moves, found 0. Piece counts: W={}, B={}",

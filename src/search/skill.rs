@@ -903,20 +903,29 @@ mod tests {
 
     /// Weak levels stop recognizing an attack, and over-value sitting still. The
     /// scaling has to move a real position's score, not just exist.
+    #[cfg(feature = "nnue")]
+    fn eval_g(game: &GameState) -> i32 {
+        evaluate(game, None)
+    }
+    #[cfg(not(feature = "nnue"))]
+    fn eval_g(game: &GameState) -> i32 {
+        evaluate(game)
+    }
+
     #[test]
     fn test_eval_style_damps_attacking_terms() {
         let mut game = GameState::new();
         // White has both rooks and the queen bearing down on a bare black king.
         game.setup_position_from_icn("w K1,1|Q6,6|R7,1|R7,2|k7,7|p6,7|p7,6");
 
-        let full_strength = evaluate(&game);
+        let full_strength = eval_g(&game);
 
         let weakest = SKILL_CONFIGS[0];
         crate::evaluation::set_eval_style(crate::evaluation::EvalStyle {
             attack_scale: weakest.attack_eval_scale,
             defense_scale: weakest.defense_eval_scale,
         });
-        let naive = evaluate(&game);
+        let naive = eval_g(&game);
         crate::evaluation::set_eval_style(crate::evaluation::EvalStyle::NEUTRAL);
 
         assert!(
@@ -924,7 +933,7 @@ mod tests {
             "level 1 should not see the attack it has: {naive} vs {full_strength}"
         );
         assert_eq!(
-            evaluate(&game),
+            eval_g(&game),
             full_strength,
             "the style must not survive past the search that installed it"
         );
@@ -945,7 +954,7 @@ mod tests {
         );
 
         let legal: Vec<Move> = game
-            .get_legal_moves()
+            .get_pseudo_legal_moves()
             .into_iter()
             .filter(|m| {
                 let undo = game.make_move(m);
@@ -1028,7 +1037,7 @@ mod tests {
     fn test_reply_blind_choice_reports_the_true_score() {
         let mut game = GameState::new();
         game.setup_position_from_icn("w K1,1|Q4,4|R1,2|P2,2|N3,1|k7,7|r4,7|b6,6|p6,7|n5,8");
-        let legal: Vec<Move> = game.get_legal_moves().into_iter().collect();
+        let legal: Vec<Move> = game.get_pseudo_legal_moves().into_iter().collect();
         let mv = legal[0];
         let result = MultiPVResult {
             lines: vec![PVLine {

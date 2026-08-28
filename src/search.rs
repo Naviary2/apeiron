@@ -463,6 +463,16 @@ impl<'a> TranspositionTableRef<'a> {
     }
 
     #[inline]
+    pub fn penalize(&self, _hash: u64, _penalty: u8) {
+        match self {
+            #[cfg(feature = "multithreading")]
+            Self::Shared(tt) => tt.penalize(_hash, _penalty),
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+
+    #[inline]
     pub fn store(&self, _params: &TTStoreParams) {
         match self {
             #[cfg(feature = "multithreading")]
@@ -560,6 +570,19 @@ pub fn probe_tt_with_shared(searcher: &Searcher, ctx: &ProbeContext) -> Option<T
         rule50_count: ctx.rule50_count,
         rule_limit: ctx.rule_limit,
     })
+}
+
+/// Penalize a TT entry. Dispatch based on thread configuration.
+#[inline(always)]
+pub fn penalize_tt_with_shared(searcher: &Searcher, hash: u64, penalty: u8) {
+    #[cfg(feature = "multithreading")]
+    if USE_SHARED_TT.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(tt) = SHARED_TT.get()
+    {
+        tt.penalize(hash, penalty);
+        return;
+    }
+    searcher.tt.penalize(hash, penalty);
 }
 
 /// Store to the TT. Dispatch based on thread configuration.
@@ -2260,7 +2283,7 @@ fn search_with_searcher(
     // persistent GameState accumulates staleness and the root list both loses legal
     // moves and gains impossible ones (measured 84% of positions after 120 plies).
     let mut moves = MoveList::new();
-    game.get_legal_moves_into(&mut moves);
+    game.get_pseudo_legal_moves_into(&mut moves);
     if moves.is_empty() {
         return None;
     }
@@ -3029,7 +3052,7 @@ pub(crate) fn get_best_moves_multipv_impl(
 
     // Get all legal moves upfront (exact: bypasses the stale slider cache)
     let mut moves = MoveList::new();
-    game.get_legal_moves_into(&mut moves);
+    game.get_pseudo_legal_moves_into(&mut moves);
     if moves.is_empty() {
         let stats = build_search_stats(searcher);
         return MultiPVResult {
@@ -3478,7 +3501,7 @@ pub fn negamax_node_count_for_depth(game: &mut GameState, depth: usize) -> u64 {
 
     // Generate and filter legal moves (exact: bypasses the stale slider cache)
     let mut moves = MoveList::new();
-    game.get_legal_moves_into(&mut moves);
+    game.get_pseudo_legal_moves_into(&mut moves);
     let mut legal_moves: MoveList = MoveList::new();
     for m in moves {
         let undo = game.make_move(&m);
@@ -4013,6 +4036,17 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
         {
             return tt_s;
         }
+
+        // Deep enough and on the right side of the window, but holding the opposite
+        // bound, so it can never cut here. Shave a ply so a real search replaces it.
+        let opposite_bound = if fails_high {
+            (tt_data_bound as u8 & TTFlag::UpperBound as u8) != 0
+        } else {
+            (tt_data_bound as u8 & TTFlag::LowerBound as u8) != 0
+        };
+        if depth > 5 && tt_data_depth_ok && tt_data_bound != TTFlag::Exact && opposite_bound {
+            penalize_tt_with_shared(searcher, hash, 1);
+        }
     }
 
     let mut tt_pv = is_pv || (tt_hit_node && tt_pv);
@@ -4048,9 +4082,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 bonus += rfp_worsening_mult() * futility_mult / 1024;
             }
 
-            // Correction history adjustment: loosen margin when eval is unreliable
-            let corr_adj = (static_eval - raw_eval).abs() / 174665;
-            let futility_margin = futility_mult * depth as i32 - bonus + corr_adj;
+            let futility_margin = futility_mult * depth as i32 - bonus;
 
             // Use refined eval for margin check and return value
             if eval - futility_margin >= beta && eval >= beta {
@@ -4612,6 +4644,14 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             }
         }
 
+        // A check delivered right at the horizon would otherwise be resolved by
+        // the qsearch boundary instead of a real reply; give it one more ply.
+        // Gated on !in_check so a forced sequence of replying checks can't chain
+        // extensions indefinitely.
+        if extension == 0 && depth <= 1 && gives_check && !in_check {
+            extension = 1;
+        }
+
         // The child reads this for evaluation smoothing. Set for every move, not only
         // on a beta cutoff, or it reflects a prior sibling's subtree instead.
         searcher.stat_score_stack[ply] = searcher.history[p_type as usize][hash_move_dest(&m)];
@@ -4658,6 +4698,18 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
 
                 // Reduce more when position is not improving
                 if !improving {
+                    reduction += 1;
+                }
+
+                // This node sat on a principal variation at some point, so it is
+                // likelier to matter than its move number suggests: reduce it less.
+                if tt_pv {
+                    reduction -= 1;
+                }
+
+                // A cut node is expected to fail high on an early move, so the moves
+                // after it are far likelier to be refutations than real candidates.
+                if cut_node {
                     reduction += 1;
                 }
 
