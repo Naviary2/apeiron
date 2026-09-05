@@ -57,14 +57,14 @@ impl SearchParamSpec {
     }
 }
 
-pub const DEFAULT_RAZORING_LINEAR: i32 = 485;
-pub const DEFAULT_RAZORING_QUAD: i32 = 281;
+pub const DEFAULT_RAZORING_LINEAR: i32 = 647;
+pub const DEFAULT_RAZORING_QUAD: i32 = 374;
 
 pub const DEFAULT_NMP_MIN_DEPTH: usize = 3;
 pub const DEFAULT_NMP_BASE: i32 = 350;
-pub const DEFAULT_NMP_DEPTH_MULT: i32 = 18;
+pub const DEFAULT_NMP_DEPTH_MULT: i32 = 36;
 pub const DEFAULT_NMP_REDUCTION_BASE: usize = 7;
-pub const DEFAULT_NMP_REDUCTION_DIV: usize = 3;
+pub const DEFAULT_NMP_REDUCTION_DIV: usize = 2;
 
 pub const DEFAULT_LMR_MIN_DEPTH: usize = 3;
 pub const DEFAULT_LMR_MIN_MOVES: usize = 4;
@@ -85,15 +85,15 @@ pub const DEFAULT_ASPIRATION_FAIL_MULT: i32 = 4;
 pub const DEFAULT_ASPIRATION_MAX_WINDOW: i32 = 1000;
 
 pub const DEFAULT_RFP_MAX_DEPTH: usize = 14;
-pub const DEFAULT_RFP_MULT_TT: i32 = 76;
-pub const DEFAULT_RFP_MULT_NO_TT: i32 = 53;
+pub const DEFAULT_RFP_MULT_TT: i32 = 101;
+pub const DEFAULT_RFP_MULT_NO_TT: i32 = 70;
 pub const DEFAULT_RFP_IMPROVING_MULT: i32 = 2474;
 pub const DEFAULT_RFP_WORSENING_MULT: i32 = 331;
 
 pub const DEFAULT_PROBCUT_MARGIN: i32 = 235;
 pub const DEFAULT_PROBCUT_IMPROVING: i32 = 63;
 pub const DEFAULT_PROBCUT_MIN_DEPTH: usize = 5;
-pub const DEFAULT_PROBCUT_DEPTH_SUB: usize = 4;
+pub const DEFAULT_PROBCUT_DEPTH_SUB: usize = 5;
 pub const DEFAULT_PROBCUT_DIVISOR: i32 = 315;
 pub const DEFAULT_LOW_DEPTH_PROBCUT_MARGIN: i32 = 800;
 

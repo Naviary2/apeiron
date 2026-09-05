@@ -256,6 +256,8 @@ pub fn value_draw(nodes: u64) -> i32 {
 /// Draw aversion. Scores are side-to-move relative and the root side moves at
 /// even ply, so the sign flips with parity to make a draw cost us either way.
 const CONTEMPT: i32 = 15;
+/// Node-count mask between slider-cache clears (every 16k nodes).
+const SLIDER_CACHE_CLEAR_MASK: u64 = 0x3FFF;
 #[inline(always)]
 fn draw_contempt(contempt: i32, ply: usize) -> i32 {
     if ply.is_multiple_of(2) { -contempt } else { contempt }
@@ -649,6 +651,9 @@ pub struct SearcherHot {
     pub best_move_nodes: u64,
     /// Running average score smoothed across iterations
     pub best_previous_average_score: i32,
+    /// Root is deep enough and the score decisive enough that mate hunting is
+    /// on: static shortcuts stop being trustworthy (mirrors Stockfish seekMate).
+    pub seek_mate: bool,
     /// Running scores for falling eval (circular buffer of last 4 iterations)
     pub iter_values: [i32; 4],
     /// Index into iter_values circular buffer
@@ -1090,6 +1095,7 @@ impl Searcher {
                 best_move_changes: 0.0,
                 best_move_nodes: 0,
                 best_previous_average_score: 0,
+                seek_mate: false,
                 iter_values: [0; 4],
                 iter_idx: 0,
                 prev_time_reduction: 1.0,
@@ -1378,6 +1384,7 @@ impl Searcher {
         self.hot.best_move_changes = 0.0;
         self.hot.best_move_nodes = 0;
         self.hot.best_previous_average_score = 0;
+        self.hot.seek_mate = false;
         self.hot.iter_values.fill(0);
         self.hot.iter_idx = 0;
         self.hot.prev_time_reduction = 1.0;
@@ -2484,6 +2491,8 @@ fn search_with_searcher(
                 0.0
             };
             let high_best_move_effort = if nodes_effort >= 93340.0 { 0.76 } else { 1.0 };
+
+            searcher.hot.seek_mate = base_depth >= 16 && best_score.abs() >= 4000;
 
             // Accumulate instability changes from this iteration
             searcher.hot.tot_best_move_changes += searcher.hot.best_move_changes;
@@ -3787,6 +3796,11 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
     // Initialize node state
     let in_check = game.is_in_check();
     searcher.hot.nodes += 1;
+    // The slider candidate cache is never invalidated per move; a periodic clear
+    // bounds how long a list built for a vanished position can hide a defence.
+    if searcher.hot.nodes & SLIDER_CACHE_CLEAR_MASK == 0 {
+        game.spatial_indices.slider_cache.borrow_mut().clear();
+    }
     searcher.pv_length[ply] = 0;
 
     // Initialize cutoff count for grandchild ply
@@ -4056,14 +4070,25 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
     if !in_check {
         // Pre-move pruning techniques
 
-        // Razoring: if eval is really low, drop to qsearch
-        if !is_pv && eval < alpha - razoring_linear() - razoring_quad() * (depth * depth) as i32 {
+        // Razoring: if eval is really low, drop to qsearch. Depth-capped the way
+        // Stockfish's quadratic margin caps itself against its mate scale: past
+        // this depth only mate-valued windows could ever clear the margin, and
+        // those nodes must search for real or shorter mates stay invisible.
+        if !is_pv
+            && depth <= 8
+            && eval < alpha - razoring_linear() - razoring_quad() * (depth * depth) as i32
+        {
             return quiescence(searcher, game, ply, 0, alpha, beta, node_type);
         }
 
         // Reverse Futility Pruning (RFP)
+        let rfp_depth_cap = if searcher.hot.seek_mate {
+            6
+        } else {
+            rfp_max_depth()
+        };
         if !tt_pv
-            && depth < rfp_max_depth()
+            && depth < rfp_depth_cap
             && (tt_move.is_none() || tt_capture)
             && !is_loss(beta)
             && !is_win(eval)
@@ -4091,8 +4116,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
         }
 
         // Null move pruning: give opponent an extra move, if still >= beta, prune
-        // Only in cut nodes with non-pawn material (avoid zugzwang)
-        if cut_node && allow_null && depth >= nmp_min_depth() && !is_loss(beta) {
+        // At every non-PV node with non-pawn material (avoid zugzwang)
+        if !is_pv && allow_null && depth >= nmp_min_depth() && !is_loss(beta) {
             let nmp_margin = static_eval - (nmp_depth_mult() * depth as i32) + nmp_base();
             if nmp_margin >= beta && game.has_non_pawn_material(game.turn) {
                 let saved_ep = game.en_passant;
@@ -4134,7 +4159,10 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     return 0;
                 }
 
-                if null_score >= beta && !is_win(null_score) {
+                // An unproven mate from a null search is not returnable as-is,
+                // but the fail-high itself is real: clamp to beta and cut.
+                let null_score = if is_win(null_score) { beta } else { null_score };
+                if null_score >= beta {
                     // At high depths, we verify the NMP cutoff by running a reduced-depth
                     // search without the null move permission. This helps identify zugzwang
                     // positions or cases where NMP was too optimistic.
@@ -4312,7 +4340,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
 
     // Singular extension conditions (checked when we reach the TT move in the loop)
     // We cache the TT probe result here to avoid re-probing
-    let se_conditions = if depth >= 6 && !in_check && tt_move.is_some() {
+    let se_conditions = if depth >= 6 && !in_check && tt_move.is_some() && !searcher.hot.seek_mate
+    {
         if tt_hit_node
             && (tt_data_bound == TTFlag::LowerBound || tt_data_bound == TTFlag::Exact)
             && tt_data_depth as usize >= depth.saturating_sub(3)
@@ -4718,7 +4747,21 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 let ph_idx = (parent_pawn_hash & PAWN_HISTORY_MASK) as usize;
                 let hist_score = searcher.history[p_type as usize][hist_idx];
                 let pawn_score = searcher.pawn_hist(ph_idx, p_type as usize, hist_idx);
-                reduction -= (hist_score + pawn_score) / 4096;
+                // Continuation history already steers ordering; the reduction
+                // stat was blind to it, so a move that follows well after the
+                // previous two plies was reduced like a stranger.
+                let mut cont_score = 0i32;
+                {
+                    let cf = hash_coord_16(m.from.x, m.from.y);
+                    let ct = hash_coord_16(m.to.x, m.to.y);
+                    for &(ci, pc, pi, pp, pt_h) in movegen.cont_history_indices.iter() {
+                        if ci < 2 {
+                            cont_score +=
+                                searcher.cont_history[ci][pc][pi][pp][pt_h][cf][ct] as i32;
+                        }
+                    }
+                }
+                reduction -= (hist_score + pawn_score) / 4096 + cont_score / 6144;
 
                 // Correction history adjustment
                 let correction = (static_eval - raw_eval) * CORRHIST_GRAIN;

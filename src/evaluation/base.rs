@@ -625,6 +625,9 @@ pub const DEFAULT_EVAL_EG_KING_DEFENDER_BONUS: i32 = 0; // Less need for defende
 // passed_pawn_adv_bonus()[canAdvance][safeAdvance][rank]
 
 pub const DEFAULT_EVAL_MG_PASSED_SAFE_PATH_BONUS: i32 = 27;
+/// A slider walled in by its own pieces at one or two squares has no unbounded
+/// reach at all; the far penalties price the opposite failure, never this one.
+pub const SLIDER_CONGESTION_UNIT: i32 = 3;
 pub const DEFAULT_EVAL_EG_PASSED_SAFE_PATH_BONUS: i32 = 67;
 
 /// Probe a square offset (dx, dy) from a piece at local tile index `idx`.
@@ -755,9 +758,7 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
     let mut b_king_ring_covered = false;
 
     let mut w_attacking_tropism: i32 = 0;
-    let mut w_defensive_tropism: i32 = 0;
     let mut b_attacking_tropism: i32 = 0;
-    let mut b_defensive_tropism: i32 = 0;
 
     let mut white_royal_tropisms: SmallVec<[_; 1]> = game
         .white_royals
@@ -799,9 +800,7 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
         .collect();
 
     // Interaction threat constants
-    const PAWN_THREATENS_MINOR: i32 = 25;
-    const PAWN_THREATENS_ROOK: i32 = 40;
-    const PAWN_THREATENS_QUEEN: i32 = 60;
+    const PAWN_THREATENS_ROYAL: i32 = 20;
     // Sliders are graded by value gap rather than bucketed: on an unbounded
     // board they are the pieces that can threaten from anywhere, and a fixed
     // tier would have to be re-cut every time the piece values are refitted.
@@ -1078,25 +1077,20 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                                             dy,
                                         ) && target.color() == enemy
                                         {
-                                            let tv = get_piece_value_base(target.piece_type());
-                                            if tv >= 600 {
-                                                if is_white {
-                                                    w_pawn_threats += PAWN_THREATENS_QUEEN;
-                                                } else {
-                                                    b_pawn_threats += PAWN_THREATENS_QUEEN;
-                                                }
-                                            } else if tv >= 400 {
-                                                if is_white {
-                                                    w_pawn_threats += PAWN_THREATENS_ROOK;
-                                                } else {
-                                                    b_pawn_threats += PAWN_THREATENS_ROOK;
-                                                }
-                                            } else if tv >= 200 {
-                                                if is_white {
-                                                    w_pawn_threats += PAWN_THREATENS_MINOR;
-                                                } else {
-                                                    b_pawn_threats += PAWN_THREATENS_MINOR;
-                                                }
+                                            let tt = target.piece_type();
+                                            let tv = get_piece_value_base(tt);
+                                            let add = if tt.is_royal() {
+                                                PAWN_THREATENS_ROYAL
+                                            } else {
+                                                let raw = (tv - piece_val).max(0);
+                                                (raw / slider_threat_div())
+                                                    .min(slider_threat_cap())
+                                            };
+
+                                            if is_white {
+                                                w_pawn_threats += add;
+                                            } else {
+                                                b_pawn_threats += add;
                                             }
                                         }
                                     }
@@ -1420,27 +1414,11 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                                     w_attacking_tropism +=
                                         tropism_contribution(piece_val, d, bk.tropism_addend);
                                 }
-                                for wk in &white_royal_tropisms {
-                                    let d = (px - wk.x).abs().max((py - wk.y).abs());
-                                    w_defensive_tropism += tropism_contribution(
-                                        piece_val.min(350),
-                                        d,
-                                        wk.tropism_addend,
-                                    );
-                                }
                             } else {
                                 for wk in &white_royal_tropisms {
                                     let d = (px - wk.x).abs().max((py - wk.y).abs());
                                     b_attacking_tropism +=
                                         tropism_contribution(piece_val, d, wk.tropism_addend);
-                                }
-                                for bk in &black_royal_tropisms {
-                                    let d = (px - bk.x).abs().max((py - bk.y).abs());
-                                    b_defensive_tropism += tropism_contribution(
-                                        piece_val.min(350),
-                                        d,
-                                        bk.tropism_addend,
-                                    );
                                 }
                             }
                         }
@@ -1628,8 +1606,6 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                         // per-side percentage, so the style composes into it: weak
                         // levels crowd their own king instead of the enemy's.
                         let gt_att_mult = taper(180, 360);
-                        let gt_def_mult = taper(120, 60);
-
                         let w_att_scale = style.attack(match game.game_rules.white_win_condition {
                             WinCondition::AllRoyalsCaptured => 80,
                             _ => 100,
@@ -1638,14 +1614,10 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                             WinCondition::AllRoyalsCaptured => 80,
                             _ => 100,
                         });
-                        let w_def_scale = style.defense(100);
-                        let b_def_scale = style.defense(100);
 
                         // Normalize by 1000 since piece values are high and we want roughly 10-100 pts
-                        let w_gt = (w_attacking_tropism * gt_att_mult * w_att_scale / 10000)
-                            + (w_defensive_tropism * gt_def_mult * w_def_scale / 10000);
-                        let b_gt = (b_attacking_tropism * gt_att_mult * b_att_scale / 10000)
-                            + (b_defensive_tropism * gt_def_mult * b_def_scale / 10000);
+                        let w_gt = w_attacking_tropism * gt_att_mult * w_att_scale / 10000;
+                        let b_gt = b_attacking_tropism * gt_att_mult * b_att_scale / 10000;
 
                         tracer.record("Global Tropism", w_gt, b_gt);
                         score += w_gt - b_gt;
@@ -2361,8 +2333,8 @@ pub fn evaluate_king_safety_traced<T: EvaluationTracer>(
     // pawns and barely notices a king it could be attacking — or one being attacked.
     let w_shelter = style.defense(w_safety * black_rc_mult / 100);
     let b_shelter = style.defense(b_safety * white_rc_mult / 100);
-    let w_pressure = style.attack(w_attack * white_rc_mult / 100);
-    let b_pressure = style.attack(b_attack * black_rc_mult / 100);
+    let w_pressure = style.attack(w_attack * white_rc_mult / 100) * 3 / 2;
+    let b_pressure = style.attack(b_attack * black_rc_mult / 100) * 3 / 2;
 
     let w_total = w_shelter + w_pressure;
     let b_total = b_shelter + b_pressure;
@@ -2418,6 +2390,47 @@ fn compute_attack_bonus_optimized(
     };
 
     diag_bonus + ortho_bonus
+}
+
+/// Congestion units for the two opposite rays sharing one spatial line: an own
+/// blocker one step out counts double what one two steps out does.
+#[inline]
+fn line_congestion(
+    line: Option<&crate::moves::SpatialLine>,
+    key: i64,
+    own: PlayerColor,
+) -> i32 {
+    let Some(l) = line else { return 0 };
+    let i = l.coords.partition_point(|&c| c < key);
+    let mut units = 0;
+    // An enemy pawn walls a ray as surely as an own piece: it is usually
+    // defended, and capturing it does not open the line the slider wanted.
+    // A neutral or an enemy pawn is a fixture; an own piece can step aside, so it
+    // walls at a discount rather than in full.
+    let wall_units = |p: Piece, d: i64| -> i32 {
+        let base = 3 - d as i32;
+        if p.piece_type().is_neutral_type() || (p.color() != own && p.piece_type() == PieceType::Pawn)
+        {
+            base
+        } else if p.color() == own {
+            base / 2
+        } else {
+            0
+        }
+    };
+    if i + 1 < l.coords.len() {
+        let d = l.coords[i + 1] - key;
+        if d <= 2 {
+            units += wall_units(Piece::from_packed(l.pieces[i + 1]), d);
+        }
+    }
+    if i > 0 {
+        let d = key - l.coords[i - 1];
+        if d <= 2 {
+            units += wall_units(Piece::from_packed(l.pieces[i - 1]), d);
+        }
+    }
+    units
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2529,6 +2542,13 @@ pub fn evaluate_rook(
             .min(far_slider_cheb_max_excess() as i64) as i32;
         let cap = get_piece_value_base(PieceType::Rook) / FAR_SLIDER_PENALTY_VALUE_DIV;
         bonus -= (excess * far_rook_penalty()).min(cap);
+    }
+
+    {
+        let idx = &game.spatial_indices;
+        let units =
+            line_congestion(idx.rows.get(&y), x, color) + line_congestion(idx.cols.get(&x), y, color);
+        bonus -= taper(units * SLIDER_CONGESTION_UNIT, units * SLIDER_CONGESTION_UNIT / 2);
     }
 
     // Open / Semi-Open File Bonus
@@ -2648,6 +2668,15 @@ pub fn evaluate_queen(
         bonus -= (excess * far_queen_penalty()).min(cap);
     }
 
+    {
+        let idx = &game.spatial_indices;
+        let units = line_congestion(idx.rows.get(&y), x, color)
+            + line_congestion(idx.cols.get(&x), y, color)
+            + line_congestion(idx.diag1.get(&(x - y)), x, color)
+            + line_congestion(idx.diag2.get(&(x + y)), x, color);
+        bonus -= taper(units * SLIDER_CONGESTION_UNIT, units * SLIDER_CONGESTION_UNIT / 2);
+    }
+
     // Open / Semi-Open File Bonus
     let (my_pawns, enemy_pawns) = if color == PlayerColor::White {
         (white_pawns, black_pawns)
@@ -2690,6 +2719,13 @@ pub fn evaluate_bishop(
     let taper =
         |mg: i32, eg: i32| -> i32 { ((mg * phase) + (eg * (MAX_PHASE - phase))) / MAX_PHASE };
     let mut bonus: i32 = 0;
+
+    {
+        let idx = &game.spatial_indices;
+        let units = line_congestion(idx.diag1.get(&(x - y)), x, color)
+            + line_congestion(idx.diag2.get(&(x + y)), x, color);
+        bonus -= taper(units * SLIDER_CONGESTION_UNIT, units * SLIDER_CONGESTION_UNIT / 2);
+    }
 
     // Scale king-targeting bonuses based on own win condition.
     let own_win_cond = if color == PlayerColor::White {
