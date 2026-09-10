@@ -532,6 +532,14 @@ impl StagedMoveGen {
                 .copied()
                 .unwrap_or(0);
             10 * victim_val - attacker_val + (cap_hist / 8)
+        } else if let Some(pt) = m.promotion {
+            // A quiet promotion has no victim, so the branch above never sees it
+            // and it sorted at 0, below every capture; price it by what it wins.
+            let attacker_val = game.get_piece_value(m.piece.piece_type(), m.piece.color());
+            let promo_gain = game.get_piece_value(pt, m.piece.color()) - attacker_val;
+            let hist_idx = hash_move_dest(m);
+            let history_score = searcher.history[m.piece.piece_type() as usize][hist_idx];
+            10 * promo_gain - attacker_val + (history_score / 8)
         } else {
             0
         }
@@ -875,7 +883,18 @@ impl StagedMoveGen {
                 indices: &game.spatial_indices,
                 enemy_king_pos: game.enemy_king_pos(),
             };
-            get_quiescence_captures(&game.board, game.turn, &ctx, &mut captures);
+            // Routed on the position-derived eval_kind, not the [Variant] tag, so an
+            // untagged obstacle board gets the same treatment a tagged one does.
+            if game.eval_kind == crate::evaluation::eval_kind::EvalKind::Obstocean {
+                crate::evaluation::variants::obstocean_search::get_quiescence_captures(
+                    &game.board,
+                    game.turn,
+                    &ctx,
+                    &mut captures,
+                );
+            } else {
+                get_quiescence_captures(&game.board, game.turn, &ctx, &mut captures);
+            }
         }
 
         for m in captures {
@@ -1191,6 +1210,23 @@ mod tests {
     }
 
     #[test]
+    fn quiet_queen_promotion_orders_above_a_pawn_capture() {
+        // A quiet promotion has no victim on its target square; it must still
+        // sort by what it wins, not fall through to the zero score.
+        let game = game_from_icn("w 0/100 1 (8;q|1;q) K5,1|k5,8|P4,7|P1,4|p2,5");
+        let searcher = Searcher::new(1_000);
+        let promo = find_move(&game, (4, 7), (4, 8));
+        assert!(promo.promotion.is_some());
+        let pxp = find_move(&game, (1, 4), (2, 5));
+        let promo_score = StagedMoveGen::score_capture(&game, &searcher, &promo);
+        let pxp_score = StagedMoveGen::score_capture(&game, &searcher, &pxp);
+        assert!(
+            promo_score > pxp_score,
+            "quiet promotion {promo_score} must outrank PxP {pxp_score}"
+        );
+    }
+
+    #[test]
     fn pseudo_legal_accepts_pawn_push_capture_and_en_passant() {
         let push_game = game_from_icn("w 0/100 1 (8;q|1;q) K5,1|k5,8|P4,2");
         let push = find_move(&push_game, (4, 2), (4, 3));
@@ -1277,7 +1313,8 @@ mod tests {
     fn move_gives_check_fast_detects_fairy_leapers() {
         // Each lands on its own leap offset from k5,8; a miss here means the check
         // is scored as a quiet and can be futility/history-pruned or cut in qsearch.
-        let cases: [(&str, PieceType, (i64, i64), (i64, i64)); 5] = [
+        type Case = (&'static str, PieceType, (i64, i64), (i64, i64));
+        let cases: [Case; 5] = [
             ("w 0/100 1 (8;q|1;q) K5,1|k5,8|CA1,1", PieceType::Camel, (1, 1), (6, 5)),
             ("w 0/100 1 (8;q|1;q) K5,1|k5,8|GI1,1", PieceType::Giraffe, (1, 1), (6, 4)),
             ("w 0/100 1 (8;q|1;q) K5,1|k5,8|ZE1,1", PieceType::Zebra, (1, 1), (7, 5)),

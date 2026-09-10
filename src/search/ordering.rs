@@ -190,10 +190,15 @@ pub fn sort_moves_root(
 fn capture_sort_key(game: &GameState, m: &Move) -> i32 {
     let attacker_color = m.piece.color();
     let attacker_val = game.get_piece_value(m.piece.piece_type(), attacker_color);
-    let victim_val = game
-        .board
-        .get_piece(m.to.x, m.to.y)
-        .map_or(0, |t| game.get_piece_value(t.piece_type(), t.color()));
+    let victim_val = match game.board.get_piece(m.to.x, m.to.y) {
+        Some(t) => game.get_piece_value(t.piece_type(), t.color()),
+        // En passant's victim sits beside the target square, not on it, so the
+        // lookup above scored a real pawn capture as a victimless move.
+        None if game.is_en_passant(m) => {
+            game.get_piece_value(crate::board::PieceType::Pawn, attacker_color.opponent())
+        }
+        None => 0,
+    };
     let promo_gain = m.promotion.map_or(0, |pt| {
         game.get_piece_value(pt, attacker_color) - attacker_val
     });
@@ -251,14 +256,6 @@ pub fn hash_move_from(m: &Move) -> usize {
     ((h ^ (h >> 32)) & 0xFF) as usize
 }
 
-/// Hash coordinate to 32-size index (for continuation history)
-#[inline]
-pub fn hash_coord_32(x: i64, y: i64) -> usize {
-    let h = (x as u64).wrapping_mul(0x517cc1b727220a95)
-        ^ (y as u64).wrapping_mul(0x9e3779b185ebca87).rotate_left(32);
-    ((h ^ (h >> 32)) & 0x1F) as usize
-}
-
 /// Continuation-history coordinate hash. Deliberately narrower than
 /// `hash_coord_32`: the extra aliasing generalises across regions of an
 /// unbounded board, and it keeps the table small enough to stay cached.
@@ -309,9 +306,25 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_coord_32() {
-        let hash = hash_coord_32(1000, -2000);
-        assert!(hash < 32);
+    fn test_sort_captures_prices_en_passant_as_a_pawn_capture() {
+        // PxP en passant (victim 100, attacker 100) must outrank NxP (victim 100,
+        // attacker 300); with the victim read from the empty target it sorted last.
+        let game = create_test_game_from_icn("w 0/100 1 (8;q|1;q) K5,1|k5,8|P5,5|p6,5|N0,0|p1,2 6,6");
+        assert!(game.en_passant.is_some(), "position must carry an en passant square");
+        let ep = Move::new(
+            Coordinate::new(5, 5),
+            Coordinate::new(6, 6),
+            Piece::new(PieceType::Pawn, PlayerColor::White),
+        );
+        assert!(game.is_en_passant(&ep));
+        let nxp = Move::new(
+            Coordinate::new(0, 0),
+            Coordinate::new(1, 2),
+            Piece::new(PieceType::Knight, PlayerColor::White),
+        );
+        let mut moves: MoveList = vec![nxp, ep].into_iter().collect();
+        sort_captures(&game, &mut moves);
+        assert_eq!((moves[0].from.x, moves[0].to.x), (5, 6), "en passant should sort first");
     }
 
     #[test]

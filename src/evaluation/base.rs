@@ -70,10 +70,9 @@ thread_local! {
     pub(crate) static EVAL_BLACK_RQ: UnsafeCell<SmallVec<[(i64, i64); 32]>> = UnsafeCell::new(SmallVec::new());
 }
 
-/// Per-level play-style weighting, in percent of the full-strength term. Damping
-/// attack and amplifying defense makes a weak level misjudge the position instead
-/// of misplaying a correct ranking. `NEUTRAL` is full strength, and only the
-/// generic evaluation honours it — `variants/` evaluators are unscaled.
+/// Per-level play-style weighting, in percent of the full-strength term: damps
+/// attack / amplifies defense so a weak level misjudges the position rather than
+/// the ranking. `NEUTRAL` is full strength; only generic eval honours this.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EvalStyle {
     pub attack_scale: i32,
@@ -318,6 +317,21 @@ pub const DEFAULT_EVAL_MIN_FAIRY_DEVELOPMENT_PENALTY: i32 = 80;
 pub const DEFAULT_EVAL_KING_DEFENDER_REF_VALUE: i32 = 250;
 pub const DEFAULT_EVAL_TIED_DEFENDER_REF_VALUE: i32 = 600;
 pub const DEFAULT_EVAL_CENTRALITY_VALUE_SCALE: i32 = 72;
+/// Counterplay units at which the weaker side is considered fully able to resist.
+pub const COMPLEXITY_RESIST_FULL: i32 = MAX_PHASE / 2;
+/// Pawn-rank spread bracketing the own-king tropism term. Set above Space_Classic's
+/// span of 27, which tested -42.5 Elo at a partial weight, so only a board as spread
+/// as Space strands material far enough from its king for the term to read true.
+pub const SPREAD_GATE_LO: i64 = 30;
+pub const SPREAD_GATE_HI: i64 = 34;
+/// Only pawns this close to promoting are worth the uncatchable scan.
+pub const UNSTOPPABLE_MAX_DIST: i64 = 5;
+pub const DEFAULT_UNSTOPPABLE_PASSER_BONUS: i32 = 400;
+pub const DEFAULT_UNSTOPPABLE_PASSER_DECAY: i32 = 60;
+#[inline]
+fn unstoppable_passer_bonus() -> i32 { DEFAULT_UNSTOPPABLE_PASSER_BONUS }
+#[inline]
+fn unstoppable_passer_decay() -> i32 { DEFAULT_UNSTOPPABLE_PASSER_DECAY }
 pub const DEFAULT_EVAL_COMPLEXITY_DAMP: i32 = 8;
 pub const DEFAULT_EVAL_COMPLEXITY_EXCESS_MAX: i32 = 40;
 pub const DEFAULT_EVAL_KING_SHIELD_AHEAD_MAX_DIST: i32 = 3;
@@ -696,6 +710,10 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
 
     // Single-Pass Collection and Scoring
     let mut phase = 0; // decreases with fewer pieces
+    // Counterplay units: like phase, but heavy pieces count double because a queen
+    // can harass forever on an unbounded board where four knights cannot.
+    let mut white_cp = 0;
+    let mut black_cp = 0;
     let mut white_undeveloped = 0;
     let mut black_undeveloped = 0;
     let mut white_bishops = 0;
@@ -759,6 +777,12 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
 
     let mut w_attacking_tropism: i32 = 0;
     let mut b_attacking_tropism: i32 = 0;
+    let mut w_defensive_tropism: i32 = 0;
+    let mut b_defensive_tropism: i32 = 0;
+    // Pawn rank spread, the gate for own-king tropism. Pawns step one rank at a
+    // time, so unlike piece placement this stays put across a search tree.
+    let mut pawn_min_y: i64 = i64::MAX;
+    let mut pawn_max_y: i64 = i64::MIN;
 
     let mut white_royal_tropisms: SmallVec<[_; 1]> = game
         .white_royals
@@ -966,10 +990,19 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                                 }
 
                                 // 1. Phase
-                                phase += get_piece_phase(pt);
+                                let pp = get_piece_phase(pt);
+                                phase += pp;
+                                let cp = if pp >= 4 { pp * 2 } else { pp };
+                                if is_white {
+                                    white_cp += cp;
+                                } else {
+                                    black_cp += cp;
+                                }
 
                                 // 2. Piece Collection (Optimized categorization)
                                 if pt == PieceType::Pawn {
+                                    pawn_min_y = pawn_min_y.min(y);
+                                    pawn_max_y = pawn_max_y.max(y);
                                     if is_white {
                                         if y < w_promo {
                                             white_pawns.push((x, y));
@@ -1397,6 +1430,10 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                             king.tropism_addend = compute_tropism_addend(total_effective_units);
                         }
 
+                        // Hoisted above the loop so a compact board, where this term
+                        // is off, does not pay to compute a value it discards.
+                        let spread = spread_gate(pawn_min_y, pawn_max_y);
+
                         // Accumulate piece-to-king tropism using the finalized addends.
                         for &(px, py, ppiece) in piece_list.iter() {
                             let ppt = ppiece.piece_type();
@@ -1414,11 +1451,31 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                                     w_attacking_tropism +=
                                         tropism_contribution(piece_val, d, bk.tropism_addend);
                                 }
+                                if spread > 0 {
+                                    for wk in &white_royal_tropisms {
+                                        let d = (px - wk.x).abs().max((py - wk.y).abs());
+                                        w_defensive_tropism += tropism_contribution(
+                                            piece_val.min(350),
+                                            d,
+                                            wk.tropism_addend,
+                                        );
+                                    }
+                                }
                             } else {
                                 for wk in &white_royal_tropisms {
                                     let d = (px - wk.x).abs().max((py - wk.y).abs());
                                     b_attacking_tropism +=
                                         tropism_contribution(piece_val, d, wk.tropism_addend);
+                                }
+                                if spread > 0 {
+                                    for bk in &black_royal_tropisms {
+                                        let d = (px - bk.x).abs().max((py - bk.y).abs());
+                                        b_defensive_tropism += tropism_contribution(
+                                            piece_val.min(350),
+                                            d,
+                                            bk.tropism_addend,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1606,6 +1663,7 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                         // per-side percentage, so the style composes into it: weak
                         // levels crowd their own king instead of the enemy's.
                         let gt_att_mult = taper(180, 360);
+                        let gt_def_mult = taper(120, 60);
                         let w_att_scale = style.attack(match game.game_rules.white_win_condition {
                             WinCondition::AllRoyalsCaptured => 80,
                             _ => 100,
@@ -1614,10 +1672,15 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                             WinCondition::AllRoyalsCaptured => 80,
                             _ => 100,
                         });
+                        // Off on a compact board, where every piece already sits near
+                        // its king and the term was a wash that cost 7 Elo to carry.
+                        let def_scale = style.defense(100) * spread / 100;
 
                         // Normalize by 1000 since piece values are high and we want roughly 10-100 pts
-                        let w_gt = w_attacking_tropism * gt_att_mult * w_att_scale / 10000;
-                        let b_gt = b_attacking_tropism * gt_att_mult * b_att_scale / 10000;
+                        let w_gt = w_attacking_tropism * gt_att_mult * w_att_scale / 10000
+                            + w_defensive_tropism * gt_def_mult * def_scale / 10000;
+                        let b_gt = b_attacking_tropism * gt_att_mult * b_att_scale / 10000
+                            + b_defensive_tropism * gt_def_mult * def_scale / 10000;
 
                         tracer.record("Global Tropism", w_gt, b_gt);
                         score += w_gt - b_gt;
@@ -1655,7 +1718,15 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
 
     // Damp the whole score by material complexity: the same advantage is worth
     // less with more resistance left, and trading it away raises the scaled score.
-    let excess = (phase - MAX_PHASE).clamp(0, complexity_excess_max());
+    let mut excess = (phase - MAX_PHASE).clamp(0, complexity_excess_max());
+    // Resistance is what the WEAKER side can still generate, so a stripped defender
+    // damps nothing however much the winner piles up. Saturates at half a starting
+    // army, leaving every position where both sides are still armed untouched.
+    let weak_cp = white_cp.min(black_cp);
+    if weak_cp < COMPLEXITY_RESIST_FULL {
+        let resist = weak_cp * weak_cp * 1024 / (COMPLEXITY_RESIST_FULL * COMPLEXITY_RESIST_FULL);
+        excess = excess * resist / 1024;
+    }
     if excess > 0 {
         let scaled = score * (1024 - complexity_damp() * excess) / 1024;
         tracer.record("Complexity scale", scaled - score, 0);
@@ -1986,7 +2057,7 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
                     PieceType::Knightrider,
                     cloud_avg_spread,
                     phase,
-                ) + evaluate_knightrider_reach(x, y, piece.color(), piece_list, phase)
+                ) + evaluate_knightrider_reach(x, y, piece.color(), &game.board, phase)
             }
             _ => 0,
         };
@@ -2037,10 +2108,8 @@ fn evaluate_pieces_processed<T: EvaluationTracer>(
         if (pt.is_minor() || pt == PieceType::Archbishop)
             && game.starting_squares.contains(&Coordinate::new(x, y))
         {
-            // A fairy leaper is near-useless from its starting square -- an odd leap
-            // pattern only pays once it has room -- while a knight or bishop at home
-            // is far less urgent. One shared value has to compromise between the two,
-            // which suits neither, so they are priced apart.
+            // A fairy leaper needs room for its odd leap pattern to pay off, unlike a
+            // knight/bishop at home; one shared value suited neither, so priced apart.
             piece_score -= if pt.is_minor() {
                 if matches!(pt, PieceType::Knight | PieceType::Bishop) {
                     // Ramped in value rather than flipped at a threshold, which paid
@@ -2179,6 +2248,23 @@ fn slider_threat_bonus(end: Option<(i64, u8)>, own: PlayerColor, piece_val: i32)
 #[inline(always)]
 fn saturating_dist_i32(d: i64) -> i32 {
     d.min(i32::MAX as i64) as i32
+}
+
+/// Own-king tropism weight from the pawn rank spread, 0..=100. A compact board
+/// keeps every piece near its king, so the term carries no information there.
+#[inline]
+fn spread_gate(pawn_min_y: i64, pawn_max_y: i64) -> i32 {
+    if pawn_max_y < pawn_min_y {
+        return 0;
+    }
+    let span = pawn_max_y - pawn_min_y;
+    if span <= SPREAD_GATE_LO {
+        0
+    } else if span >= SPREAD_GATE_HI {
+        100
+    } else {
+        ((span - SPREAD_GATE_LO) * 100 / (SPREAD_GATE_HI - SPREAD_GATE_LO)) as i32
+    }
 }
 
 /// One piece's king-tropism contribution: `numerator / (chebyshev_dist + addend)`.
@@ -2403,10 +2489,9 @@ fn line_congestion(
     let Some(l) = line else { return 0 };
     let i = l.coords.partition_point(|&c| c < key);
     let mut units = 0;
-    // An enemy pawn walls a ray as surely as an own piece: it is usually
-    // defended, and capturing it does not open the line the slider wanted.
-    // A neutral or an enemy pawn is a fixture; an own piece can step aside, so it
-    // walls at a discount rather than in full.
+    // An enemy pawn walls a ray as surely as an own piece (usually defended, and
+    // capturing it doesn't open the line). Own pieces can step aside, so they
+    // wall at a discount; neutral/enemy pawns are fixtures and wall in full.
     let wall_units = |p: Piece, d: i64| -> i32 {
         let base = 3 - d as i32;
         if p.piece_type().is_neutral_type() || (p.color() != own && p.piece_type() == PieceType::Pawn)
@@ -3566,6 +3651,53 @@ fn compute_pawn_core<T: EvaluationTracer>(
 /// Scores passed pawns live (never cached): king distances, blockers and the
 /// promotion path change every move and must stay current for conversion play.
 #[allow(clippy::too_many_arguments)]
+/// Chebyshev squares an enemy piece covers per move when racing to a promotion
+/// square. `None` means a slider or rider, which crosses arbitrary distance and so
+/// is never outrun.
+fn chase_reach(pt: PieceType) -> Option<i64> {
+    match pt {
+        PieceType::King | PieceType::Guard => Some(1),
+        PieceType::Knight | PieceType::Centaur | PieceType::RoyalCentaur => Some(2),
+        PieceType::Zebra | PieceType::Camel => Some(3),
+        PieceType::Giraffe => Some(4),
+        // Pawns cannot leave their file to catch a passer on another one.
+        PieceType::Pawn | PieceType::Obstacle | PieceType::Void => Some(0),
+        // Everything else slides or rides: treat as uncatchable-by-distance.
+        _ => None,
+    }
+}
+
+/// Can the side to promote get there before anything reaches the promotion square?
+/// Conservative: a single enemy slider anywhere means no, since it can usually
+/// intercept the file in one move.
+fn passer_is_unstoppable(
+    game: &GameState,
+    promo_sq: (i64, i64),
+    moves_to_promo: i64,
+    defender: PlayerColor,
+) -> bool {
+    if moves_to_promo <= 0 {
+        return false;
+    }
+    for (x, y, pc) in game.board.iter() {
+        if pc.color() != defender {
+            continue;
+        }
+        let Some(reach) = chase_reach(pc.piece_type()) else {
+            return false;
+        };
+        if reach == 0 {
+            continue;
+        }
+        let d = (x - promo_sq.0).abs().max((y - promo_sq.1).abs());
+        // Ceiling division: moves this piece needs to reach the promotion square.
+        if (d + reach - 1) / reach <= moves_to_promo {
+            return false;
+        }
+    }
+    true
+}
+
 fn score_passed_pawns<T: EvaluationTracer>(
     game: &GameState,
     phase: i32,
@@ -3642,7 +3774,20 @@ fn score_passed_pawns<T: EvaluationTracer>(
 
         let base_bonus =
             passed_pawn_adv_bonus()[can_advance as usize][safe_advance as usize][rel_rank];
-        w_passed_score += base_bonus + friendly_king_bonus - enemy_king_penalty + safe_path_bonus;
+        // A pawn nothing can catch is a queen, not a bonus; the graded terms above
+        // top out far below that and the search needs ~75x its match budget to see it.
+        // A blockaded pawn is going nowhere however far the defenders are: "passed"
+        // only rules out enemy pawns, not a knight parked in front of it.
+        let unstoppable = safe_path
+            && dist_to_promo <= UNSTOPPABLE_MAX_DIST
+            && passer_is_unstoppable(game, (wx, w_promo), dist_to_promo, PlayerColor::Black);
+        let unstoppable_bonus = if unstoppable {
+            (unstoppable_passer_bonus() - unstoppable_passer_decay() * (dist_to_promo - 1) as i32).max(0)
+        } else {
+            0
+        };
+        w_passed_score +=
+            base_bonus + friendly_king_bonus - enemy_king_penalty + safe_path_bonus + unstoppable_bonus;
     }
 
     for &(bx, by) in b_passed {
@@ -3700,7 +3845,16 @@ fn score_passed_pawns<T: EvaluationTracer>(
 
         let base_bonus =
             passed_pawn_adv_bonus()[can_advance as usize][safe_advance as usize][rel_rank];
-        b_passed_score += base_bonus + friendly_king_bonus - enemy_king_penalty + safe_path_bonus;
+        let unstoppable = safe_path
+            && dist_to_promo <= UNSTOPPABLE_MAX_DIST
+            && passer_is_unstoppable(game, (bx, b_promo), dist_to_promo, PlayerColor::White);
+        let unstoppable_bonus = if unstoppable {
+            (unstoppable_passer_bonus() - unstoppable_passer_decay() * (dist_to_promo - 1) as i32).max(0)
+        } else {
+            0
+        };
+        b_passed_score +=
+            base_bonus + friendly_king_bonus - enemy_king_penalty + safe_path_bonus + unstoppable_bonus;
     }
 
     if tracer.is_active() {

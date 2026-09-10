@@ -661,13 +661,13 @@ impl Engine {
         // Calculate scaled time (remaining time minus one move overhead)
         let scaled_time = remaining_ms.saturating_sub(move_overhead);
 
-        // Maximum move horizon (centiMTG = moves to go * 100)
-        // For games without movestogo, assume ~50 moves remaining
-        // If less than 1 second, gradually reduce moves to go estimate
+        // centiMTG = moves-to-go * 100. Games here run far past a chess clock's ~50-move
+        // assumption (32k-corpus median 224 plies); assuming too few remain front-loads
+        // the clock, decaying 9.5s to 1.4s with no recovery.
         let centi_mtg: i64 = if scaled_time >= 1000 {
-            5051 // 50.51 moves * 100
+            11200 // 112 moves * 100
         } else {
-            ((scaled_time as f64) * 5.051) as i64
+            ((scaled_time as f64) * 11.2) as i64
         };
         let centi_mtg = centi_mtg.max(100); // At least 1 move expected
 
