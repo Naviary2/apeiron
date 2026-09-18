@@ -1473,23 +1473,12 @@ impl GameState {
         let mut rh: u64 = 0;
 
         // Hash all pieces (excluding obstacles/voids for performance)
-        if let Some(active) = &self.board.active_coords {
-            for (x, y) in active {
-                let piece = match self.board.get_piece(*x, *y) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                h ^= piece_key(piece.piece_type(), piece.color(), *x, *y);
-                rh ^= rep_piece_key(piece.piece_type(), piece.color(), *x, *y);
-            }
-        } else {
-            for (x, y, piece) in self.board.iter() {
-                if piece.color() == PlayerColor::Neutral {
-                    continue;
-                }
-                h ^= piece_key(piece.piece_type(), piece.color(), x, y);
-                rh ^= rep_piece_key(piece.piece_type(), piece.color(), x, y);
-            }
+        // Every piece, neutrals included: make_move xors a captured obstacle out, so
+        // leaving them out here made the two paths disagree after any obstacle capture,
+        // and made two boards differing only by an obstacle hash the same.
+        for (x, y, piece) in self.board.iter() {
+            h ^= piece_key(piece.piece_type(), piece.color(), x, y);
+            rh ^= rep_piece_key(piece.piece_type(), piece.color(), x, y);
         }
 
         let (castle_h, castle_rh) = self.castling_hash_pair();
@@ -1721,13 +1710,20 @@ impl GameState {
             if pt.is_royal() {
                 // King moves: destination must not be attacked, or the mover's win
                 // condition must allow its king to be captured
-                use crate::moves::is_square_attacked;
-                if is_square_attacked(
+                use crate::moves::{is_square_attacked, knightrider_attacks_square_exact};
+                // The root list must be exact, so the capped rider walk inside
+                // is_square_attacked is backed up by an uncapped check here.
+                if (is_square_attacked(
                     &self.board,
                     &m.to,
                     self.turn.opponent(),
                     &self.spatial_indices,
-                ) && !self.king_capturable(self.turn)
+                ) || knightrider_attacks_square_exact(
+                    &self.board,
+                    &m.to,
+                    self.turn.opponent(),
+                    &self.spatial_indices,
+                )) && !self.king_capturable(self.turn)
                 {
                     illegal = true;
                 }
@@ -4400,6 +4396,118 @@ mod tests {
         assert_eq!(mh, game.material_hash, "{label}: material_hash drifted");
         assert_eq!(wpc, game.white_pawn_count, "{label}: white_pawn_count drifted");
         assert_eq!(bpc, game.black_pawn_count, "{label}: black_pawn_count drifted");
+    }
+
+    /// Every incremental hash must equal a from-scratch recompute after each make,
+    /// and must return to its previous value after the matching undo. Covers the move
+    /// kinds one variant at a time so the world-bounds global is never interleaved.
+    /// A knightrider attacks along knight rays without limit, but the attack query
+    /// that decides legality stops after 20 hops, so a king step onto a square only a
+    /// distant rider covers was returned as legal.
+    #[test]
+    fn root_rejects_king_step_into_a_distant_knightrider_ray() {
+        let mut game = GameState::new();
+        // Black knightrider at (21,42): 21 hops of (-1,-2) reach (0,0) on a clear ray.
+        game.setup_position_from_icn("w 0/100 1 K1,1+|k9,9+|nr21,42");
+        let target = Coordinate::new(0, 0);
+        let mut moves = crate::moves::MoveList::new();
+        game.get_pseudo_legal_moves_into(&mut moves);
+        let step = moves
+            .iter()
+            .find(|m| m.from == Coordinate::new(1, 1) && m.to == target)
+            .copied();
+        let Some(step) = step else {
+            return; // that king step is not generated here; nothing to assert
+        };
+        let undo = game.make_move(&step);
+        let illegal = game.is_move_illegal();
+        game.undo_move(&step, undo);
+        assert!(
+            illegal,
+            "king stepped onto a square a knightrider covers from 21 hops away"
+        );
+    }
+
+    #[test]
+    fn incremental_hashes_match_scratch_across_make_and_undo() {
+        for variant in [
+            crate::Variant::Classical,
+            crate::Variant::Palace,
+            crate::Variant::CoaIPNO,
+            crate::Variant::PawnHorde,
+            crate::Variant::Obstocean,
+        ] {
+            let mut game = GameState::new();
+            game.setup_position_from_icn(variant.starting_icn());
+            game.variant = Some(variant);
+
+            // Deterministic walk: take a spread of moves at each ply rather than
+            // always the first, so captures and promotions are actually reached.
+            for ply in 0..24usize {
+                let snapshot = (
+                    game.hash,
+                    game.rep_hash,
+                    game.pawn_hash,
+                    game.white_nonpawn_hash,
+                    game.black_nonpawn_hash,
+                    game.material_hash,
+                    game.minor_hash,
+                );
+
+                let mut moves = crate::moves::MoveList::new();
+                game.get_pseudo_legal_moves_into(&mut moves);
+                let legal: Vec<_> = moves
+                    .iter()
+                    .copied()
+                    .filter(|m| {
+                        let undo = game.make_move(m);
+                        let ok = !game.is_move_illegal();
+                        game.undo_move(m, undo);
+                        ok
+                    })
+                    .collect();
+                if legal.is_empty() {
+                    break;
+                }
+                let m = legal[(ply * 7 + 3) % legal.len()];
+
+                let undo = game.make_move(&m);
+
+                // Primary key and repetition key, checked against a full rebuild.
+                let (inc_hash, inc_rep) = (game.hash, game.rep_hash);
+                game.recompute_hash();
+                assert_eq!(
+                    inc_hash, game.hash,
+                    "{variant:?} ply {ply}: hash drifted on {m:?}"
+                );
+                assert_eq!(
+                    inc_rep, game.rep_hash,
+                    "{variant:?} ply {ply}: rep_hash drifted on {m:?}"
+                );
+                assert_incremental_state_matches_scratch(
+                    &mut game,
+                    &format!("{variant:?} ply {ply} make"),
+                );
+
+                game.undo_move(&m, undo);
+
+                assert_eq!(
+                    snapshot,
+                    (
+                        game.hash,
+                        game.rep_hash,
+                        game.pawn_hash,
+                        game.white_nonpawn_hash,
+                        game.black_nonpawn_hash,
+                        game.material_hash,
+                        game.minor_hash,
+                    ),
+                    "{variant:?} ply {ply}: undo did not restore every hash after {m:?}"
+                );
+
+                game.make_move(&m);
+            }
+        }
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::board::PieceType;
 use crate::game::GameState;
 use crate::moves::{Move, MoveList};
 
@@ -32,9 +33,19 @@ pub fn score_move(
         return sort_hash(); // Early return - TT move always first
     }
 
-    // Capture scoring
-    if let Some(target) = game.board.get_piece(m.to.x, m.to.y) {
-        let victim_val = game.get_piece_value(target.piece_type(), target.color());
+    // Capture scoring. En passant's victim sits beside m.to rather than on it, so
+    // the square lookup alone sorted a real pawn capture among the quiets.
+    let ep_victim = game
+        .is_en_passant(m)
+        .then(|| (PieceType::Pawn, m.piece.color().opponent()));
+    let victim = game
+        .board
+        .get_piece(m.to.x, m.to.y)
+        .map(|t| (t.piece_type(), t.color()))
+        .or(ep_victim);
+
+    if let Some((victim_type, victim_color)) = victim {
+        let victim_val = game.get_piece_value(victim_type, victim_color);
         let attacker_val = game.get_piece_value(m.piece.piece_type(), m.piece.color());
         // Include promotion gain so capture-promotions sort by their true value.
         let promo_gain = m.promotion.map_or(0, |pt| {
@@ -46,7 +57,7 @@ pub fn score_move(
 
         // Capture history
         let cap_hist =
-            searcher.capture_history[m.piece.piece_type() as usize][target.piece_type() as usize];
+            searcher.capture_history[m.piece.piece_type() as usize][victim_type as usize];
 
         score += mvv_lva + (cap_hist / 8);
         if is_winning {
@@ -90,7 +101,7 @@ pub fn score_move(
             // Main history heuristic
             let idx = hash_move_dest(m);
             let pt_idx = m.piece.piece_type() as usize;
-            score += 2 * searcher.history[pt_idx][idx];
+            score += 2 * searcher.history[crate::search::hist_color(m.piece.color())][pt_idx][idx];
 
             let ph_idx = (game.pawn_hash & crate::search::PAWN_HISTORY_MASK) as usize;
             score += 2 * searcher.pawn_hist(ph_idx, pt_idx, idx);
@@ -118,6 +129,13 @@ pub fn score_move(
                         score += (val * CONT_WEIGHTS[idx]) / 1024;
                     }
                 }
+            }
+
+            // A quiet promotion keeps every quiet signal above; the material it wins
+            // is added on top so it still outranks ordinary quiets.
+            if let Some(promo) = m.promotion {
+                let attacker_val = game.get_piece_value(m.piece.piece_type(), m.piece.color());
+                score += 10 * (game.get_piece_value(promo, m.piece.color()) - attacker_val);
             }
 
             // Low-ply history bonus (same index as the writer and the staged picker).
@@ -185,34 +203,38 @@ pub fn sort_moves_root(
 }
 
 /// MVV-LVA ordering key. Promotion gain is added to the victim value so
-/// promotions (including quiet ones) sort by their true material swing.
+/// promotions (including quiet ones) sort by their true material swing, and
+/// capture history breaks ties the way the interior picker already does.
 #[inline]
-fn capture_sort_key(game: &GameState, m: &Move) -> i32 {
+fn capture_sort_key(searcher: &Searcher, game: &GameState, m: &Move) -> i32 {
     let attacker_color = m.piece.color();
     let attacker_val = game.get_piece_value(m.piece.piece_type(), attacker_color);
-    let victim_val = match game.board.get_piece(m.to.x, m.to.y) {
-        Some(t) => game.get_piece_value(t.piece_type(), t.color()),
+    let (victim_val, victim_type) = match game.board.get_piece(m.to.x, m.to.y) {
+        Some(t) => (game.get_piece_value(t.piece_type(), t.color()), t.piece_type()),
         // En passant's victim sits beside the target square, not on it, so the
         // lookup above scored a real pawn capture as a victimless move.
-        None if game.is_en_passant(m) => {
-            game.get_piece_value(crate::board::PieceType::Pawn, attacker_color.opponent())
-        }
-        None => 0,
+        None if game.is_en_passant(m) => (
+            game.get_piece_value(PieceType::Pawn, attacker_color.opponent()),
+            PieceType::Pawn,
+        ),
+        None => (0, PieceType::Pawn),
     };
     let promo_gain = m.promotion.map_or(0, |pt| {
         game.get_piece_value(pt, attacker_color) - attacker_val
     });
-    (victim_val + promo_gain) * 10 - attacker_val
+    let cap_hist =
+        searcher.capture_history[m.piece.piece_type() as usize][victim_type as usize];
+    (victim_val + promo_gain) * 10 - attacker_val + (cap_hist / 8)
 }
 
 /// Fast capture sorting using MVV-LVA + promotion value (no SEE for qsearch).
 #[allow(clippy::needless_range_loop)]
-pub fn sort_captures(game: &GameState, moves: &mut MoveList) {
+pub fn sort_captures(searcher: &Searcher, game: &GameState, moves: &mut MoveList) {
     // For captures, use selection sort since qsearch usually has few captures
     if moves.len() <= 16 {
         let mut scores = [0i32; 128];
         for (i, m) in moves.iter().enumerate() {
-            scores[i] = capture_sort_key(game, m);
+            scores[i] = capture_sort_key(searcher, game, m);
         }
 
         for i in 0..moves.len().saturating_sub(1) {
@@ -232,7 +254,7 @@ pub fn sort_captures(game: &GameState, moves: &mut MoveList) {
             }
         }
     } else {
-        moves.sort_by_cached_key(|m| -capture_sort_key(game, m));
+        moves.sort_by_cached_key(|m| -capture_sort_key(searcher, game, m));
     }
 }
 
@@ -323,7 +345,7 @@ mod tests {
             Piece::new(PieceType::Knight, PlayerColor::White),
         );
         let mut moves: MoveList = vec![nxp, ep].into_iter().collect();
-        sort_captures(&game, &mut moves);
+        sort_captures(&Searcher::new(u128::MAX), &game, &mut moves);
         assert_eq!((moves[0].from.x, moves[0].to.x), (5, 6), "en passant should sort first");
     }
 
@@ -346,7 +368,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        sort_captures(&game, &mut moves);
+        sort_captures(&Searcher::new(u128::MAX), &game, &mut moves);
 
         assert_eq!(moves[0].to.x, 4);
         assert_eq!(moves[0].to.y, 4);

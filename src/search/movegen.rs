@@ -70,6 +70,7 @@ pub struct StagedMoveGen {
     moves: Vec<ScoredMove>,
     cur: usize,
     end_bad_captures: usize,
+    end_bad_quiets: usize,
     end_captures: usize,
     end_generated: usize,
 
@@ -129,7 +130,20 @@ impl StagedMoveGen {
         searcher: &Searcher,
         game: &GameState,
     ) -> Self {
-        let is_in_check = Self::is_in_check(game);
+        Self::new_with_check(tt_move, ply, depth, searcher, game, game.is_in_check())
+    }
+
+    /// Same as [`new`], for callers that already know whether the side to move is
+    /// attacked: recomputing it here costs a full attack scan per node.
+    pub fn new_with_check(
+        tt_move: Option<Move>,
+        ply: usize,
+        depth: i32,
+        searcher: &Searcher,
+        game: &GameState,
+        in_check: bool,
+    ) -> Self {
+        let is_in_check = in_check && game.must_escape_check();
         let tt_move = tt_move.map(|m| Self::reconstruct_castling_partner(game, m));
         let tt_valid = tt_move.is_some() && Self::is_pseudo_legal(game, &tt_move.unwrap());
         // An invalid TT move must not linger: the later stages filter "the TT
@@ -218,6 +232,7 @@ impl StagedMoveGen {
             moves: Vec::new(),
             cur: 0,
             end_bad_captures: 0,
+            end_bad_quiets: 0,
             end_captures: 0,
             end_generated: 0,
             ply,
@@ -373,10 +388,22 @@ impl StagedMoveGen {
                 {
                     return false;
                 }
+                // Both ends need their rights, and the pair must stand at least three
+                // apart, or the king would land on or past its partner.
+                if !game.special_rights.contains(&m.from)
+                    || !game.special_rights.contains(partner)
+                    || partner.y != m.from.y
+                    || (partner.x - m.from.x).abs() < 3
+                    || (partner.x - m.from.x).signum() != (m.to.x - m.from.x).signum()
+                {
+                    return false;
+                }
+                // The partner must be the nearest piece along the row: anything in
+                // between blocks the castle, however far apart the two ends are.
                 let dir = if dx > 0 { 1 } else { -1 };
-                if game.board.is_occupied(m.from.x + dir, m.from.y)
-                    || game.board.is_occupied(m.to.x, m.from.y)
-                    || (dir < 0 && game.board.is_occupied(m.from.x - 3, m.from.y))
+                if let Some(row_pieces) = game.spatial_indices.rows.get(&m.from.y)
+                    && let Some((nearest_x, _)) = row_pieces.find_nearest(m.from.x, dir)
+                    && ((dir > 0 && nearest_x < partner.x) || (dir < 0 && nearest_x > partner.x))
                 {
                     return false;
                 }
@@ -401,8 +428,10 @@ impl StagedMoveGen {
                     if dy == dir {
                         !target_occupied
                     } else if dy == 2 * dir {
-                        // 2 steps
-                        if target_occupied {
+                        // 2 steps. The right is per-square and a killer outlives the
+                        // pawn that earned it, so a different pawn now standing there
+                        // must not inherit its double step.
+                        if target_occupied || !game.special_rights.contains(&m.from) {
                             return false;
                         }
                         // Intermediate square: one direct occ_all read (reuse
@@ -516,7 +545,8 @@ impl StagedMoveGen {
                 .unwrap_or(0);
 
             let hist_idx = hash_move_dest(m);
-            let history_score = searcher.history[pt_idx][hist_idx];
+            let history_score =
+                searcher.history[crate::search::hist_color(m.piece.color())][pt_idx][hist_idx];
 
             10 * (victim_val + promo_gain) - attacker_val + (cap_hist / 8) + (history_score / 8)
         } else if game.is_en_passant(m) {
@@ -538,7 +568,8 @@ impl StagedMoveGen {
             let attacker_val = game.get_piece_value(m.piece.piece_type(), m.piece.color());
             let promo_gain = game.get_piece_value(pt, m.piece.color()) - attacker_val;
             let hist_idx = hash_move_dest(m);
-            let history_score = searcher.history[m.piece.piece_type() as usize][hist_idx];
+            let history_score = searcher.history[crate::search::hist_color(m.piece.color())]
+                [m.piece.piece_type() as usize][hist_idx];
             10 * promo_gain - attacker_val + (history_score / 8)
         } else {
             0
@@ -597,7 +628,12 @@ impl StagedMoveGen {
         unsafe {
             if pt_idx < 32 {
                 // Bounds check for safety, though piece type should be valid
-                let val = *searcher.history.get_unchecked(pt_idx).get_unchecked(idx);
+                let side = crate::search::hist_color(m.piece.color());
+                let val = *searcher
+                    .history
+                    .get_unchecked(side)
+                    .get_unchecked(pt_idx)
+                    .get_unchecked(idx);
                 score += 2 * val;
             }
         }
@@ -756,7 +792,9 @@ impl StagedMoveGen {
     /// Fast check detection
     #[inline(always)]
     pub fn move_gives_check_fast(game: &GameState, m: &Move) -> bool {
-        let pt = m.piece.piece_type();
+        // What stands on the destination after the move, which is the promoted piece
+        // for a promotion; testing those with the pawn's geometry misses the check.
+        let pt = m.promotion.unwrap_or(m.piece.piece_type());
         let color = m.piece.color();
         let tx = m.to.x;
         let ty = m.to.y;
@@ -854,6 +892,32 @@ impl StagedMoveGen {
         false
     }
 
+    /// Continuation-history slots for this ply. Built before the killer stages as
+    /// well as the quiet one, or a killer searched late reads an empty list and gets
+    /// none of the reduction relief every other quiet move gets.
+    fn ensure_cont_history_indices(&mut self, searcher: &Searcher) {
+        if !self.cont_history_indices.is_empty() {
+            return;
+        }
+        let ply = self.ply;
+        let offsets = [1usize, 2, 4];
+        for (idx, &plies_ago) in offsets.iter().enumerate() {
+            if let Some(prev_idx) = ply.checked_sub(plies_ago)
+                && let Some(Some(prev_move)) = searcher.move_history.get(prev_idx)
+                && let Some(&prev_piece) = searcher.moved_piece_history.get(prev_idx)
+            {
+                let prev_piece = prev_piece as usize;
+                if prev_piece < 32 {
+                    let prev_to_h = hash_coord_16(prev_move.to.x, prev_move.to.y);
+                    let prev_ic = searcher.in_check_history[prev_idx] as usize;
+                    let prev_cap = searcher.capture_history_stack[prev_idx] as usize;
+                    self.cont_history_indices
+                        .push((idx, prev_cap, prev_ic, prev_piece, prev_to_h));
+                }
+            }
+        }
+    }
+
     /// Compute and cache the side-to-move pin map, shared by the capture and
     /// quiet stages.
     fn ensure_pins(&mut self, game: &GameState) {
@@ -873,10 +937,12 @@ impl StagedMoveGen {
     fn generate_captures(&mut self, game: &GameState, searcher: &Searcher) {
         let mut captures = MoveList::new();
 
-        self.ensure_pins(game);
+        // Only quiet slider generation reads the pin map, so the capture stage
+        // pays nothing for one.
+        let no_pins = rustc_hash::FxHashMap::default();
         {
             let ctx = MoveGenContext {
-                pinned: self.pins_cache.as_ref().unwrap(),
+                pinned: &no_pins,
                 special_rights: &game.special_rights,
                 en_passant: &game.en_passant,
                 game_rules: &game.game_rules,
@@ -1025,6 +1091,7 @@ impl StagedMoveGen {
                     if self.skip_quiets {
                         continue;
                     }
+                    self.ensure_cont_history_indices(searcher);
 
                     if let Some(m) = self.killer1
                         && !self.is_tt_move(&m)
@@ -1066,28 +1133,7 @@ impl StagedMoveGen {
 
                     let quiet_start = self.moves.len();
 
-                    // Pre-calculate history indices
-                    if self.cont_history_indices.is_empty() {
-                        let ply = self.ply;
-                        let offsets = [1usize, 2, 4];
-                        for (idx, &plies_ago) in offsets.iter().enumerate() {
-                            if let Some(prev_idx) = ply.checked_sub(plies_ago)
-                                && let Some(Some(prev_move)) = searcher.move_history.get(prev_idx)
-                                && let Some(&prev_piece) =
-                                    searcher.moved_piece_history.get(prev_idx)
-                            {
-                                let prev_piece = prev_piece as usize;
-                                if prev_piece < 32 {
-                                    let prev_to_h = hash_coord_16(prev_move.to.x, prev_move.to.y);
-                                    let prev_ic = searcher.in_check_history[prev_idx] as usize;
-                                    let prev_cap =
-                                        searcher.capture_history_stack[prev_idx] as usize;
-                                    self.cont_history_indices
-                                        .push((idx, prev_cap, prev_ic, prev_piece, prev_to_h));
-                                }
-                            }
-                        }
-                    }
+                    self.ensure_cont_history_indices(searcher);
 
                     self.generate_quiets(game, searcher);
                     self.end_generated = self.moves.len();
@@ -1097,6 +1143,7 @@ impl StagedMoveGen {
                     partial_insertion_sort(&mut self.moves[quiet_start..], limit);
 
                     self.cur = quiet_start;
+                    self.end_bad_quiets = quiet_start;
                     self.stage = MoveStage::GoodQuiet;
                 }
 
@@ -1108,12 +1155,15 @@ impl StagedMoveGen {
                     }
 
                     while self.cur < self.end_generated {
-                        let sm = self.moves[self.cur];
-                        self.cur += 1;
-
-                        if sm.score > GOOD_QUIET_THRESHOLD {
-                            return Some(sm.m);
+                        if self.moves[self.cur].score > GOOD_QUIET_THRESHOLD {
+                            let m = self.moves[self.cur].m;
+                            self.cur += 1;
+                            return Some(m);
                         }
+                        // Bad quiet - swap to the front of the quiet span for later
+                        self.moves.swap(self.end_bad_quiets, self.cur);
+                        self.end_bad_quiets += 1;
+                        self.cur += 1;
                     }
 
                     // Prepare for bad captures
@@ -1139,13 +1189,10 @@ impl StagedMoveGen {
                         return None;
                     }
 
-                    while self.cur < self.end_generated {
-                        let sm = self.moves[self.cur];
+                    if self.cur < self.end_bad_quiets {
+                        let m = self.moves[self.cur].m;
                         self.cur += 1;
-
-                        if sm.score <= GOOD_QUIET_THRESHOLD {
-                            return Some(sm.m);
-                        }
+                        return Some(m);
                     }
 
                     self.stage = MoveStage::Done;
@@ -1195,6 +1242,33 @@ mod tests {
     use super::*;
     use crate::board::{Coordinate, Piece, PieceType};
     use crate::search::Searcher;
+
+    /// A castling partner may stand any distance away on the row, so validation must
+    /// use the same rules the generator does: rights on both ends, at least three
+    /// apart, and nothing in between. It previously demanded the square three files
+    /// out be empty, which is the partner itself at the minimum legal distance.
+    #[test]
+    fn pseudo_legal_accepts_castling_with_a_partner_three_squares_away() {
+        let game = game_from_icn("w 0/100 1 K5,1+|R2,1+|k5,8+");
+        let mut moves = crate::moves::MoveList::new();
+        game.get_pseudo_legal_moves_into(&mut moves);
+        let castle = moves
+            .iter()
+            .find(|m| m.from == Coordinate::new(5, 1) && m.to == Coordinate::new(3, 1))
+            .copied()
+            .expect("generator emits the castle with a partner three away");
+        assert!(
+            StagedMoveGen::is_pseudo_legal(&game, &castle),
+            "a legal castle was rejected, so a killer naming it would be dropped"
+        );
+
+        // A piece between the two ends blocks it, however far apart they are.
+        let blocked = game_from_icn("w 0/100 1 K5,1+|R1,1+|N3,1|k5,8+");
+        assert!(
+            !StagedMoveGen::is_pseudo_legal(&blocked, &castle),
+            "castling must be rejected when a piece stands between king and partner"
+        );
+    }
 
     fn game_from_icn(icn: &str) -> GameState {
         let mut game = GameState::new();
@@ -1395,10 +1469,20 @@ mod tests {
             "pawn must not push through a void"
         );
 
-        // Control: with the square clear both pushes are pseudo-legal.
-        let clear = game_from_icn("w 0/100 1 (8;q|1;q) K1,1|P4,4|k8,8");
+        // Control: with the square clear the single push is pseudo-legal, and the
+        // double push is too once the pawn actually holds its double-step right.
+        let clear = game_from_icn("w 0/100 1 (8;q|1;q) K1,1|P4,4+|k8,8");
         assert!(StagedMoveGen::is_pseudo_legal(&clear, &push));
         assert!(StagedMoveGen::is_pseudo_legal(&clear, &double));
+
+        // Without that right the generator never emits the double step, so a stale
+        // killer naming it must not be replayed either.
+        let no_right = game_from_icn("w 0/100 1 (8;q|1;q) K1,1|P4,4|k8,8");
+        assert!(StagedMoveGen::is_pseudo_legal(&no_right, &push));
+        assert!(
+            !StagedMoveGen::is_pseudo_legal(&no_right, &double),
+            "a pawn with no double-step right must not double-push"
+        );
     }
 
     #[test]

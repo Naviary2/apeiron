@@ -21,6 +21,22 @@ thread_local! {
     /// never invalidated, so its target set can be stale for the current
     /// occupancy and omit legal moves. Exact move lists set this to skip it.
     static SLIDER_CACHE_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Bare-king conversion: also generate the quiet squares that wall the
+    /// defender in. A slider only escapes the distance filter by giving check,
+    /// so the square one line beside his - the one that builds a wall - is not
+    /// generated at all past sixteen squares, and no evaluation can reach a
+    /// formation the move list does not contain.
+    static WALL_TARGETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable wall-target generation for lone-king conversions. Changing it clears
+/// the slider cache, whose entries are keyed only by (square, direction) and
+/// would otherwise serve a target set built under the other mode.
+pub fn set_wall_targets(on: bool, indices: &SpatialIndices) {
+    if WALL_TARGETS.with(|c| c.replace(on)) != on {
+        indices.slider_cache.borrow_mut().clear();
+    }
 }
 
 /// Generate slider candidates without consulting or filling the position-stale
@@ -127,11 +143,17 @@ fn generate_knightrider_moves(board: &Board, from: &Coordinate, piece: &Piece) -
         (-2, -1),
     ];
 
-    let piece_count = board.len();
     let mut moves = MoveList::new();
 
-    // Pre-collect piece data once
-    let mut pieces_data: Vec<(i64, i64, bool)> = Vec::with_capacity(piece_count);
+    // Reused across calls: this ran once per knightrider per stage and the board is
+    // walked in full each time, so a fresh allocation here is pure churn.
+    thread_local! {
+        static KR_PIECES: std::cell::RefCell<Vec<(i64, i64, bool)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    KR_PIECES.with(|cell| {
+    let mut pieces_data = cell.borrow_mut();
+    pieces_data.clear();
     // BITBOARD: Use tile-based CTZ iteration for O(popcount) piece enumeration
     for (cx, cy, tile) in board.tiles.iter() {
         let mut bits = tile.occ_all;
@@ -154,7 +176,7 @@ fn generate_knightrider_moves(board: &Board, from: &Coordinate, piece: &Piece) -
         let mut closest_k: i64 = i64::MAX;
         let mut closest_is_enemy = false;
 
-        for &(px, py, is_enemy) in &pieces_data {
+        for &(px, py, is_enemy) in pieces_data.iter() {
             let rx = px - from.x;
             let ry = py - from.y;
 
@@ -242,6 +264,57 @@ fn generate_knightrider_moves(board: &Board, from: &Coordinate, piece: &Piece) -
     }
 
     moves
+    })
+}
+
+/// Exact knightrider attack test, with no hop cap. `is_square_attacked` stops its
+/// outward walk after 20 hops for speed, which is fine inside the tree but lets the
+/// ROOT call a king step legal when only a distant rider covers the square.
+pub fn knightrider_attacks_square_exact(
+    board: &Board,
+    target: &Coordinate,
+    attacker_color: PlayerColor,
+    indices: &SpatialIndices,
+) -> bool {
+    let attacker_idx = if attacker_color == PlayerColor::White {
+        0
+    } else {
+        1
+    };
+    if !indices.has_knightrider[attacker_idx] {
+        return false;
+    }
+    for (px, py, piece) in board.iter() {
+        if piece.piece_type() != PieceType::Knightrider || piece.color() != attacker_color {
+            continue;
+        }
+        let (rx, ry) = (target.x - px, target.y - py);
+        // Must sit on one of the eight knight rays at an integral hop count.
+        let (ax, ay) = (rx.abs(), ry.abs());
+        let k = if ax * 2 == ay {
+            ay / 2
+        } else if ay * 2 == ax {
+            ax / 2
+        } else {
+            continue;
+        };
+        if k == 0 {
+            continue;
+        }
+        let (sx, sy) = (rx / k, ry / k);
+        // Every intermediate landing must be empty for the ride to reach the target.
+        let mut blocked = false;
+        for step in 1..k {
+            if board.get_piece(px + sx * step, py + sy * step).is_some() {
+                blocked = true;
+                break;
+            }
+        }
+        if !blocked {
+            return true;
+        }
+    }
+    false
 }
 
 /// Check if a coordinate is within valid bounds (world border)
@@ -489,10 +562,15 @@ pub type LineEnd = Option<(i64, u8)>;
 /// Below this length a linear scan beats a binary search on these lines.
 const LINEAR_SCAN_MAX: usize = 16;
 
+/// Inline capacity covers the measured 90% of lines holding <= 4 pieces, so the
+/// common make/undo that first occupies a line no longer mallocs and frees.
+pub type LineCoords = smallvec::SmallVec<[i64; 4]>;
+pub type LinePieces = smallvec::SmallVec<[u8; 4]>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct SpatialLine {
-    pub coords: Vec<i64>,
-    pub pieces: Vec<u8>,
+    pub coords: LineCoords,
+    pub pieces: LinePieces,
 }
 
 impl<'a> IntoIterator for &'a SpatialLine {
@@ -511,8 +589,8 @@ impl SpatialLine {
     #[inline]
     pub fn new() -> Self {
         Self {
-            coords: Vec::with_capacity(8),
-            pieces: Vec::with_capacity(8),
+            coords: LineCoords::new(),
+            pieces: LinePieces::new(),
         }
     }
 
@@ -3225,6 +3303,37 @@ fn generate_sliding_moves_impl(
                                     royal_dists.insert(d);
                                 }
                             }
+                        }
+                    }
+                }
+
+                // 3b. Wall targets: the quiet squares just beside his lines.
+                if WALL_TARGETS.with(|c| c.get())
+                    && let Some(ek) = ek_ref
+                {
+                    // Along a diagonal one of x+y, x-y is fixed and the other
+                    // moves by two a step; along a rank or file, x or y moves
+                    // by one. Pick whichever this ray actually changes.
+                    let (base, king_line, step) = if dir_x != 0 && dir_y != 0 {
+                        if dir_x == dir_y {
+                            (from.x + from.y, ek.x + ek.y, 2 * dir_x)
+                        } else {
+                            (from.x - from.y, ek.x - ek.y, 2 * dir_x)
+                        }
+                    } else if dir_x != 0 {
+                        (from.x, ek.x, dir_x)
+                    } else {
+                        (from.y, ek.y, dir_y)
+                    };
+                    for offset in [-2i64, -1, 1, 2] {
+                        let delta = king_line + offset - base;
+                        if delta == 0 || delta % step != 0 {
+                            continue;
+                        }
+                        let d = delta / step;
+                        if d > 0 && d <= max_dist {
+                            add_dist(&mut dist_counts, d, max_dist);
+                            royal_dists.insert(d);
                         }
                     }
                 }
