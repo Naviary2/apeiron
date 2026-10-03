@@ -94,6 +94,9 @@ struct Mat {
     knightriders: u8,
     huygens: u8,
     royal_centaurs: u8,
+    /// Non-royal types with no insufficiency rule of their own: Centaur, Rose,
+    /// Camel, Giraffe, Zebra.
+    others: u8,
 }
 
 impl Mat {
@@ -112,6 +115,7 @@ impl Mat {
             + self.amazons
             + self.knightriders
             + self.huygens
+            + self.others
     }
 }
 
@@ -125,11 +129,16 @@ fn no_exotic_pieces(m: &Mat) -> bool {
         && m.amazons == 0
         && m.knightriders == 0
         && m.huygens == 0
+        && m.others == 0
 }
 
 // Decision tree for insufficient material detection.
 #[inline]
 fn is_insufficient(m: &Mat) -> bool {
+    // No mating rule covers these, so never declare the draw.
+    if m.others > 0 {
+        return false;
+    }
     // INSUFFICIENT CASES (return true - cannot deliver mate)
     // Only royals - no other pieces
     if no_exotic_pieces(m)
@@ -390,6 +399,10 @@ fn is_insufficient(m: &Mat) -> bool {
 /// Bordered variant (smaller map).
 #[inline]
 fn is_insufficient_bordered(m: &Mat) -> bool {
+    // No mating rule covers these, so never declare the draw.
+    if m.others > 0 {
+        return false;
+    }
     // INSUFFICIENT CASES (return true)
     // Huygens 1-4 alone (less than 5 is insufficient)
     if m.huygens >= 1
@@ -507,7 +520,8 @@ fn count_both(board: &Board, rules: &crate::game::GameRules) -> (Mat, Mat) {
             PieceType::Amazon => m.amazons += 1,
             PieceType::Knightrider => m.knightriders += 1,
             PieceType::Huygen => m.huygens += 1,
-            _ => {}
+            // An uncounted piece reads as an empty army and draws a won game.
+            _ => m.others = m.others.saturating_add(1),
         }
     }
 
@@ -640,6 +654,27 @@ fn compute(game: &crate::game::GameState) -> bool {
 /// endgame, which game handlers must not auto-declare a draw.
 #[inline]
 fn is_helpmate_only_combo(a: &Mat, b: &Mat, bordered: bool) -> bool {
+    // 2B vs Q (either direction)
+    let bb_vs_q = |x: &Mat, y: &Mat| {
+        (x.bishops_lb + x.bishops_db) == 2
+            && x.queens == 0
+            && x.rooks == 0
+            && x.knights == 0
+            && x.pawns == 0
+            && no_exotic_pieces(x)
+            && x.non_royal() == 2
+            && y.queens == 1
+            && y.rooks == 0
+            && y.knights == 0
+            && (y.bishops_lb + y.bishops_db) == 0
+            && y.pawns == 0
+            && no_exotic_pieces(y)
+            && y.non_royal() == 1
+    };
+    if bb_vs_q(a, b) || bb_vs_q(b, a) {
+        return true;
+    }
+
     // R+B vs Q (either direction)
     let rb_vs_q = |x: &Mat, y: &Mat| {
         x.rooks == 1
@@ -1109,6 +1144,42 @@ mod tests {
         game.recompute_hash();
         game.recompute_correction_hashes();
         game
+    }
+
+    /// infinitechess.org's insuffmat table lists no scenario containing a
+    /// centaur, rose, camel, giraffe or zebra, so `isSubsumedBy` can never match
+    /// one and the site always calls such a position sufficient. These five were
+    /// dropped on the floor here, making a won position adjudicate as a draw.
+    #[test]
+    fn unlisted_fairy_armies_are_never_called_insufficient() {
+        use PieceType as P;
+        for pt in [P::Centaur, P::Rose, P::Camel, P::Giraffe, P::Zebra] {
+            let game = create_test_game_with_pieces(&[
+                (0, 0, P::King, PlayerColor::White),
+                (1, 5, pt, PlayerColor::White),
+                (0, 4, pt, PlayerColor::White),
+                (0, 2, P::King, PlayerColor::Black),
+            ]);
+            assert!(
+                !evaluate_insufficient_material(&game),
+                "two {pt:?} plus a king is not an insufficient-material draw"
+            );
+        }
+    }
+
+    /// The reported counterexample: CE1,5->0,3 is mate in one, yet the position
+    /// before it was adjudicated a draw and the evaluation wrapper returned 0.
+    #[test]
+    fn centaur_premate_is_not_adjudicated_a_draw() {
+        use PieceType as P;
+        let game = create_test_game_with_pieces(&[
+            (0, 0, P::King, PlayerColor::White),
+            (1, 5, P::Centaur, PlayerColor::White),
+            (0, 4, P::Centaur, PlayerColor::White),
+            (0, 2, P::King, PlayerColor::Black),
+        ]);
+        assert!(!evaluate_insufficient_material(&game));
+        assert!(!evaluate_insufficient_material_game_handler(&game));
     }
 
     /// Every config infinitechess.org's practice mode lists as matable (see
@@ -1815,5 +1886,15 @@ mod tests {
             evaluate_insufficient_material(&game),
             "K+2 Knightriders vs K is a draw"
         );
+    }
+
+    /// K+Q vs K+2B is only drawn without help, so the game goes on; the eval still
+    /// scores it as the dead draw it is.
+    #[test]
+    fn queen_vs_two_bishops_is_not_terminal() {
+        let mut game = GameState::new();
+        game.setup_position_from_icn("b 0/100 1 K4,-1|Q3,1|k3,4|b3,3|b1,1");
+        assert!(!evaluate_insufficient_material_game_handler(&game));
+        assert!(evaluate_insufficient_material(&game));
     }
 }

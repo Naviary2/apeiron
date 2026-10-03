@@ -56,10 +56,35 @@ pub enum MoveStage {
 struct ScoredMove {
     m: Move,
     score: i32,
+    /// Set only where quiet scoring already computed it; negamax reuses it
+    /// instead of running a second `move_gives_check_fast` on the same move.
+    gives_check: Option<bool>,
 }
 
 /// (idx, prev_cap, prev_ic, prev_piece, prev_to_h)
 type ContHistoryIndex = (usize, usize, usize, usize, usize);
+
+// Scored-move buffers returned on drop: the picker is built once per interior
+// node, and a fresh Vec there is a malloc/free per node.
+thread_local! {
+    static PICKER_VECS: std::cell::RefCell<Vec<Vec<ScoredMove>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Drop for StagedMoveGen {
+    fn drop(&mut self) {
+        let mut v = std::mem::take(&mut self.moves);
+        if v.capacity() > 0 {
+            v.clear();
+            PICKER_VECS.with(|p| {
+                let mut p = p.borrow_mut();
+                if p.len() < 64 {
+                    p.push(v);
+                }
+            });
+        }
+    }
+}
 
 /// Staged move generator
 pub struct StagedMoveGen {
@@ -71,6 +96,7 @@ pub struct StagedMoveGen {
     cur: usize,
     end_bad_captures: usize,
     end_bad_quiets: usize,
+    cached_gives_check: Option<bool>,
     end_captures: usize,
     end_generated: usize,
 
@@ -84,6 +110,10 @@ pub struct StagedMoveGen {
     prev_to_hash: usize,
 
     // Killers (scored in score_quiet, not separate stages)
+    /// Last (square, attacked) answers for this node. Generation groups moves by
+    /// piece, so one queen's 30 quiets asked the same question 30 times.
+    memo_from: std::cell::Cell<Option<(i64, i64, bool)>>,
+    memo_victim: std::cell::Cell<Option<(i64, i64, bool)>>,
     killer1: Option<Move>,
     killer2: Option<Move>,
 
@@ -186,11 +216,13 @@ impl StagedMoveGen {
     ) -> Self {
         debug_assert!(!Self::is_in_check(game), "ProbCut not used when in check");
 
-        // TT move valid only if it's a capture and pseudo-legal
+        // TT move valid only if it's a pseudo-legal capture passing the same SEE
+        // threshold as every other ProbCut capture.
         let tt_move = tt_move.map(|m| Self::reconstruct_castling_partner(game, m));
         let tt_valid = tt_move.is_some()
             && Self::is_capture(game, &tt_move.unwrap())
-            && Self::is_pseudo_legal(game, &tt_move.unwrap());
+            && Self::is_pseudo_legal(game, &tt_move.unwrap())
+            && super::see_ge(game, &tt_move.unwrap(), threshold);
 
         let start_stage = if tt_valid {
             MoveStage::ProbCutTT
@@ -198,7 +230,9 @@ impl StagedMoveGen {
             MoveStage::ProbCutInit
         };
 
-        Self::init(tt_move, 0, 0, threshold, searcher, start_stage)
+        // An unusable TT move must not be filtered out of the capture stage either: a
+        // quiet promotion is generated there, and it is ProbCut's best candidate.
+        Self::init(tt_move.filter(|_| tt_valid), 0, 0, threshold, searcher, start_stage)
     }
 
     fn init(
@@ -209,10 +243,11 @@ impl StagedMoveGen {
         searcher: &Searcher,
         stage: MoveStage,
     ) -> Self {
-        let (prev_from_hash, prev_to_hash) = if ply > 0 {
+        // After a null move the slot is (0, 0), a bucket real moves share: no countermove.
+        let (prev_from_hash, prev_to_hash) = if ply > 0 && searcher.plies_from_null[ply] != 1 {
             searcher.prev_move_stack[ply - 1]
         } else {
-            (0, 0)
+            (usize::MAX, usize::MAX)
         };
 
         let killer1 = if ply < searcher.killers.len() {
@@ -229,10 +264,13 @@ impl StagedMoveGen {
         Self {
             stage,
             tt_move,
-            moves: Vec::new(),
+            moves: PICKER_VECS
+                .with(|p| p.borrow_mut().pop())
+                .unwrap_or_else(|| Vec::with_capacity(64)),
             cur: 0,
             end_bad_captures: 0,
             end_bad_quiets: 0,
+            cached_gives_check: None,
             end_captures: 0,
             end_generated: 0,
             ply,
@@ -240,6 +278,8 @@ impl StagedMoveGen {
             threshold,
             prev_from_hash,
             prev_to_hash,
+            memo_from: std::cell::Cell::new(None),
+            memo_victim: std::cell::Cell::new(None),
             killer1,
             killer2,
             skip_quiets: false,
@@ -275,6 +315,11 @@ impl StagedMoveGen {
     }
 
     #[inline]
+    fn moves_match_opt(a: &Option<Move>, b: &Option<Move>) -> bool {
+        a.as_ref().is_some_and(|a| Self::moves_match(a, b))
+    }
+
+    #[inline]
     fn moves_match(a: &Move, b: &Option<Move>) -> bool {
         match b {
             Some(bm) => a.from == bm.from && a.to == bm.to && a.promotion == bm.promotion,
@@ -291,7 +336,7 @@ impl StagedMoveGen {
     /// move fails pseudo-legality and is then skipped as already-tried when generation
     /// produces it. Rebuild the partner by the same nearest-eligible rule.
     fn reconstruct_castling_partner(game: &GameState, mut m: Move) -> Move {
-        if m.partner_coord.is_some() || !m.piece.piece_type().is_royal() {
+        if m.partner_x != crate::moves::NO_PARTNER || !m.piece.piece_type().is_royal() {
             return m;
         }
         let dx = m.to.x - m.from.x;
@@ -309,7 +354,7 @@ impl StagedMoveGen {
                 && !partner.piece_type().is_royal()
                 && game.special_rights.contains(&partner_coord)
             {
-                m.partner_coord = Some(partner_coord);
+                m.partner_x = partner_coord.x;
             }
         }
         m
@@ -379,9 +424,10 @@ impl StagedMoveGen {
         if piece.piece_type().is_royal() {
             let dx = m.to.x - m.from.x;
             if m.to.y == m.from.y && dx.abs() > 1 {
-                let Some(partner) = &m.partner_coord else {
+                if m.partner_x == crate::moves::NO_PARTNER {
                     return false;
-                };
+                }
+                let partner = crate::board::Coordinate::new(m.partner_x, m.from.y);
                 if !game
                     .board
                     .is_occupied_by_color(partner.x, partner.y, game.turn)
@@ -391,7 +437,7 @@ impl StagedMoveGen {
                 // Both ends need their rights, and the pair must stand at least three
                 // apart, or the king would land on or past its partner.
                 if !game.special_rights.contains(&m.from)
-                    || !game.special_rights.contains(partner)
+                    || !game.special_rights.contains(&partner)
                     || partner.y != m.from.y
                     || (partner.x - m.from.x).abs() < 3
                     || (partner.x - m.from.x).signum() != (m.to.x - m.from.x).signum()
@@ -406,6 +452,18 @@ impl StagedMoveGen {
                     && ((dir > 0 && nearest_x < partner.x) || (dir < 0 && nearest_x > partner.x))
                 {
                     return false;
+                }
+                // As the generator: under checkmate rules the king may not castle out of,
+                // or through, an attacked square (legality only checks where it lands).
+                if game.must_escape_check() {
+                    let opp = game.turn.opponent();
+                    let idx = &game.spatial_indices;
+                    for step in 0..=2 {
+                        let sq = crate::board::Coordinate::new(m.from.x + dir * step, m.from.y);
+                        if crate::moves::is_square_attacked(&game.board, &sq, opp, idx) {
+                            return false;
+                        }
+                    }
                 }
                 return true;
             }
@@ -577,7 +635,7 @@ impl StagedMoveGen {
     }
 
     /// Score quiet move using history heuristics (includes killer/countermove bonuses)
-    fn score_quiet(&self, game: &GameState, searcher: &Searcher, m: &Move) -> i32 {
+    fn score_quiet(&self, game: &GameState, searcher: &Searcher, m: &Move) -> (i32, Option<bool>) {
         let mut score: i32 = DEFAULT_SORT_QUIET;
 
         // Killer bonus (integrated into scoring, not separate stages)
@@ -587,21 +645,21 @@ impl StagedMoveGen {
             && m.to == k1.to
             && m.promotion == k1.promotion
         {
-            return sort_killer1();
+            return (sort_killer1(), None);
         }
         if let Some(k2) = self.killer2
             && m.from == k2.from
             && m.to == k2.to
             && m.promotion == k2.promotion
         {
-            return sort_killer2();
+            return (sort_killer2(), None);
         }
 
         // A run to the far shell is a last resort, so it belongs behind every other
         // quiet: full-width searching it costs ~20% nodes, and returning here also
         // skips the attack scan below for a move that almost never attacks anything.
         if crate::moves::is_far_escape_move(m) {
-            return GOOD_QUIET_THRESHOLD - 1;
+            return (GOOD_QUIET_THRESHOLD - 1, None);
         }
 
         // Countermove bonus
@@ -609,6 +667,7 @@ impl StagedMoveGen {
             let entry = unsafe {
                 searcher
                     .countermoves
+                    .get_unchecked(crate::search::hist_color(m.piece.color()))
                     .get_unchecked(self.prev_from_hash)
                     .get_unchecked(self.prev_to_hash)
             };
@@ -649,17 +708,19 @@ impl StagedMoveGen {
         const CONT_WEIGHTS: [i32; 3] = [1024, 712, 410];
         for &(idx, prev_cap, prev_ic, prev_piece, prev_to_h) in &self.cont_history_indices {
             // Access: cont_history[idx][prev_cap][prev_ic][prev_piece][prev_to_h][cur_from_hash][cur_to_hash]
-            let val = searcher.cont_history[idx][prev_cap][prev_ic][prev_piece][prev_to_h]
+            let slot = idx + 3 * crate::search::hist_color(m.piece.color());
+            let val = searcher.cont_history[slot][prev_cap][prev_ic][prev_piece][prev_to_h]
                 [cur_from_hash][cur_to_hash] as i32;
             score += (val * CONT_WEIGHTS[idx]) / 1024;
         }
 
-        if Self::move_gives_check_fast(game, m) && super::see_ge(game, m, -75) {
+        let gives_check = Self::move_gives_check_fast(game, m);
+        if gives_check && super::see_ge(game, m, -75) {
             score += 16384;
         }
 
         if self.ply < LOW_PLY_HISTORY_SIZE {
-            let move_hash = hash_move_dest(m) & LOW_PLY_HISTORY_MASK;
+            let move_hash = idx & LOW_PLY_HISTORY_MASK;
             unsafe {
                 if let Some(row) = searcher.low_ply_history.get(self.ply) {
                     let val = *row.get_unchecked(move_hash);
@@ -672,46 +733,61 @@ impl StagedMoveGen {
         // unlike dest-hashed history this signal does not alias at deep nodes. Gated to
         // depth >= 4, since the shallow nodes are the bulk of the tree.
         if self.depth >= 4 {
-            let empty_pins = rustc_hash::FxHashMap::default();
-            let ctx = crate::moves::MoveGenContext {
-                special_rights: &game.special_rights,
-                en_passant: &game.en_passant,
-                game_rules: &game.game_rules,
-                indices: &game.spatial_indices,
-                enemy_king_pos: game.enemy_king_pos(),
-                pinned: &empty_pins,
-            };
             let mover = m
                 .promotion
                 .map(|pt| crate::board::Piece::new(pt, m.piece.color()))
                 .unwrap_or(m.piece);
-            let mut caps = MoveList::new();
-            crate::moves::generate_captures_for_piece(&game.board, &mover, &m.to, &ctx, &mut caps);
-            let mut best_vv = 0;
-            let mut best_sq = None;
-            for c in caps.iter() {
-                if let Some(vic) = game.board.get_piece(c.to.x, c.to.y)
-                    && vic.color() != m.piece.color()
-                    && vic.color() != PlayerColor::Neutral
-                    && !vic.piece_type().is_uncapturable()
-                {
-                    let vv = game.get_piece_value(vic.piece_type(), vic.color());
-                    if vv > best_vv {
-                        best_vv = vv;
-                        best_sq = Some(c.to);
+            let value_of = |pt: PieceType, c: PlayerColor| game.get_piece_value(pt, c);
+            let (best_vv, best_sq) = match crate::moves::best_capture_victim(
+                &game.board,
+                &mover,
+                &m.to,
+                &game.spatial_indices,
+                &value_of,
+            ) {
+                Some(found) => found,
+                None => {
+                    // Knightrider, rose and huygen rays still need the generator.
+                    let empty_pins = rustc_hash::FxHashMap::default();
+                    let ctx = crate::moves::MoveGenContext {
+                        special_rights: &game.special_rights,
+                        en_passant: &game.en_passant,
+                        game_rules: &game.game_rules,
+                        indices: &game.spatial_indices,
+                        enemy_king_pos: game.enemy_king_pos(),
+                        pinned: &empty_pins,
+                    };
+                    let mut caps = MoveList::new();
+                    crate::moves::generate_captures_for_piece(
+                        &game.board,
+                        &mover,
+                        &m.to,
+                        &ctx,
+                        &mut caps,
+                    );
+                    let mut bv = 0;
+                    let mut bs = None;
+                    for c in caps.iter() {
+                        if let Some(vic) = game.board.get_piece(c.to.x, c.to.y)
+                            && vic.color() != m.piece.color()
+                            && vic.color() != PlayerColor::Neutral
+                            && !vic.piece_type().is_uncapturable()
+                        {
+                            let vv = game.get_piece_value(vic.piece_type(), vic.color());
+                            if vv > bv {
+                                bv = vv;
+                                bs = Some(c.to);
+                            }
+                        }
                     }
+                    (bv, bs)
                 }
-            }
+            };
             if best_vv > 0 {
                 let mut q = best_vv * 6;
                 // Undefended victim: no piece of the victim's color covers its square.
                 if let Some(sq) = best_sq
-                    && !crate::moves::is_square_attacked(
-                        &game.board,
-                        &sq,
-                        m.piece.color().opponent(),
-                        &game.spatial_indices,
-                    )
+                    && !self.square_attacked_memo(game, &sq, &self.memo_victim, m.piece.color())
                 {
                     q *= 2;
                 }
@@ -722,28 +798,55 @@ impl StagedMoveGen {
             // it early or LMR and LMP bury the defensive resource.
             let mover_val = game.get_piece_value(m.piece.piece_type(), m.piece.color());
             if mover_val >= 250
-                && crate::moves::is_square_attacked(
-                    &game.board,
-                    &m.from,
-                    m.piece.color().opponent(),
-                    &game.spatial_indices,
-                )
+                && self.square_attacked_memo(game, &m.from, &self.memo_from, m.piece.color())
                 && !crate::moves::is_square_attacked(
                     &game.board,
                     &m.to,
                     m.piece.color().opponent(),
                     &game.spatial_indices,
                 )
+                && !Self::attacked_through_origin(game, m)
             {
                 score += (mover_val * 5).min(10000);
             }
         }
 
-        score
+        (score, Some(gives_check))
+    }
+
+    /// `is_square_attacked` against a one-entry memo. The picker scores a single
+    /// position, so a repeated square always has the same answer.
+    #[inline]
+    fn square_attacked_memo(
+        &self,
+        game: &GameState,
+        sq: &crate::board::Coordinate,
+        memo: &std::cell::Cell<Option<(i64, i64, bool)>>,
+        mover: PlayerColor,
+    ) -> bool {
+        if let Some((x, y, v)) = memo.get()
+            && x == sq.x
+            && y == sq.y
+        {
+            return v;
+        }
+        let v = crate::moves::is_square_attacked(
+            &game.board,
+            sq,
+            mover.opponent(),
+            &game.spatial_indices,
+        );
+        memo.set(Some((sq.x, sq.y, v)));
+        v
     }
 
     /// Score evasion move
-    fn score_evasion(&self, game: &GameState, searcher: &Searcher, m: &Move) -> i32 {
+    fn score_evasion(
+        &self,
+        game: &GameState,
+        searcher: &Searcher,
+        m: &Move,
+    ) -> (i32, Option<bool>) {
         if Self::is_capture(game, m) {
             // Capture: PieceValue + (1 << 28)
             let captured_val = game
@@ -751,11 +854,37 @@ impl StagedMoveGen {
                 .get_piece(m.to.x, m.to.y)
                 .map(|p| game.get_piece_value(p.piece_type(), p.color()))
                 .unwrap_or(0);
-            captured_val + (1 << 28)
+            (captured_val + (1 << 28), None)
         } else {
             // Quiet: use history
             self.score_quiet(game, searcher, m)
         }
+    }
+
+    /// A piece retreating along the line it is attacked on still stands on that line:
+    /// the pre-move board hides the attacker behind the mover's own origin.
+    fn attacked_through_origin(game: &GameState, m: &Move) -> bool {
+        let (dx, dy) = (m.from.x - m.to.x, m.from.y - m.to.y);
+        if !(dx == 0 || dy == 0 || dx.abs() == dy.abs()) {
+            return false;
+        }
+        let (sx, sy) = (dx.signum(), dy.signum());
+        let ortho = sx == 0 || sy == 0;
+        game.spatial_indices
+            .find_first_blocker(m.from.x, m.from.y, sx, sy)
+            .is_some_and(|(_, _, p)| {
+                p.color() == m.piece.color().opponent()
+                    && if ortho {
+                        crate::attacks::is_ortho_slider(p.piece_type())
+                    } else {
+                        crate::attacks::is_diag_slider(p.piece_type())
+                    }
+            })
+            && crate::evaluation::base::is_clear_line_between_fast(
+                &game.spatial_indices,
+                &m.to,
+                &m.from,
+            )
     }
 
     /// Is the ray between two aligned squares clear once `vacated` is emptied?
@@ -799,9 +928,8 @@ impl StagedMoveGen {
         let tx = m.to.x;
         let ty = m.to.y;
 
-        // Knights and pawns: test the current royal positions directly. The old
-        // precomputed set was built once at setup, so it was wrong for every node
-        // where a royal had moved -- and this arithmetic beats a hash probe.
+        // Knights and pawns: test the live royal positions directly. This arithmetic
+        // beats a hash probe, and a set built at setup goes stale once a royal moves.
         if pt == PieceType::Knight || pt == PieceType::Pawn {
             let royals = if color == PlayerColor::White {
                 &game.black_royals
@@ -832,6 +960,37 @@ impl StagedMoveGen {
 
         if royals.is_empty() {
             return false;
+        }
+
+        // Riders whose geometry the masks below don't cover: ask the attack test. The
+        // board still has the mover on its origin, which only matters if it blocks.
+        if matches!(pt, PieceType::Knightrider | PieceType::Rose | PieceType::Huygen) {
+            use crate::moves::{ROSE_REACH, ROSE_SPAN};
+            let mover = crate::board::Piece::new(pt, color);
+            return royals.iter().any(|k| {
+                // The test generates every move of the piece, but both generators only
+                // land on their own geometry, so a royal off it is never attacked.
+                let (dx, dy) = (k.x - tx, k.y - ty);
+                let (adx, ady) = (dx.abs(), dy.abs());
+                let reachable = match pt {
+                    PieceType::Knightrider => adx > 0 && ady > 0 && (ady == 2 * adx || adx == 2 * ady),
+                    PieceType::Rose => {
+                        adx <= ROSE_SPAN
+                            && ady <= ROSE_SPAN
+                            && ROSE_REACH[(dx + ROSE_SPAN) as usize][(dy + ROSE_SPAN) as usize] != 0
+                    }
+                    _ => true,
+                };
+                reachable
+                    && crate::moves::is_piece_attacking_square(
+                        &game.board,
+                        &mover,
+                        &m.to,
+                        k,
+                        &game.spatial_indices,
+                        &game.game_rules,
+                    )
+            });
         }
 
         use crate::attacks::{
@@ -927,7 +1086,8 @@ impl StagedMoveGen {
             } else {
                 game.black_royals.first().copied()
             };
-            self.pins_cache = Some(match king_pos {
+            // A king that may be captured pins nothing: moving off the line is legal.
+            self.pins_cache = Some(match king_pos.filter(|_| !game.king_capturable(game.turn)) {
                 Some(kp) => game.compute_pins(&kp, game.turn),
                 None => rustc_hash::FxHashMap::default(),
             });
@@ -963,12 +1123,16 @@ impl StagedMoveGen {
             }
         }
 
-        for m in captures {
+        for &m in captures.iter() {
             if self.is_tt_move(&m) || self.is_excluded(&m) {
                 continue;
             }
             let score = Self::score_capture(game, searcher, &m);
-            self.moves.push(ScoredMove { m, score });
+            self.moves.push(ScoredMove {
+                m,
+                score,
+                gives_check: None,
+            });
         }
     }
 
@@ -998,16 +1162,27 @@ impl StagedMoveGen {
             }
         }
 
-        for m in quiets {
+        let obstocean = game.eval_kind == crate::evaluation::eval_kind::EvalKind::Obstocean;
+        for &m in quiets.iter() {
             if self.is_tt_move(&m)
                 || self.is_excluded(&m)
+                || (obstocean
+                    && m.piece.piece_type() == PieceType::Pawn
+                    && m.from.x != m.to.x
+                    && crate::evaluation::variants::obstocean_search::keeps_obstacle_capture(
+                        m.from.x, m.to.x,
+                    ))
                 || Self::moves_match(&m, &self.killer1)
                 || Self::moves_match(&m, &self.killer2)
             {
                 continue;
             }
-            let score = self.score_quiet(game, searcher, &m);
-            self.moves.push(ScoredMove { m, score });
+            let (score, gives_check) = self.score_quiet(game, searcher, &m);
+            self.moves.push(ScoredMove {
+                m,
+                score,
+                gives_check,
+            });
         }
     }
 
@@ -1015,17 +1190,29 @@ impl StagedMoveGen {
         let mut evasions = MoveList::new();
         game.get_evasion_moves_into(&mut evasions);
 
-        for m in evasions {
+        for &m in evasions.iter() {
             if self.is_tt_move(&m) || self.is_excluded(&m) {
                 continue;
             }
-            let score = self.score_evasion(game, searcher, &m);
-            self.moves.push(ScoredMove { m, score });
+            let (score, gives_check) = self.score_evasion(game, searcher, &m);
+            self.moves.push(ScoredMove {
+                m,
+                score,
+                gives_check,
+            });
         }
     }
 
     /// Get next move using multi-stage generation
+    /// Gives-check bit for the move `next` just returned, when quiet scoring
+    /// already computed it. Valid until the next `next` call.
+    #[inline]
+    pub fn cached_gives_check(&self) -> Option<bool> {
+        self.cached_gives_check
+    }
+
     pub fn next(&mut self, game: &GameState, searcher: &Searcher) -> Option<Move> {
+        self.cached_gives_check = None;
         loop {
             match self.stage {
                 MoveStage::MainTT
@@ -1098,10 +1285,14 @@ impl StagedMoveGen {
                         && !self.is_excluded(&m)
                         && !Self::is_capture(game, &m)
                         && !game.is_en_passant(&m)
+                        && m.promotion.is_none()
                         && Self::is_pseudo_legal(game, &m)
                     {
                         return Some(m);
                     }
+                    // A killer that doesn't fit here (another piece on its square, a
+                    // capture now) must not filter or bonus the real quiet it matches.
+                    self.killer1 = None;
                 }
 
                 MoveStage::Killer2 => {
@@ -1117,9 +1308,13 @@ impl StagedMoveGen {
                         && !Self::moves_match(&m, &self.killer1)
                         && !Self::is_capture(game, &m)
                         && !game.is_en_passant(&m)
+                        && m.promotion.is_none()
                         && Self::is_pseudo_legal(game, &m)
                     {
                         return Some(m);
+                    }
+                    if !Self::moves_match_opt(&self.killer2, &self.killer1) {
+                        self.killer2 = None;
                     }
                 }
 
@@ -1156,9 +1351,10 @@ impl StagedMoveGen {
 
                     while self.cur < self.end_generated {
                         if self.moves[self.cur].score > GOOD_QUIET_THRESHOLD {
-                            let m = self.moves[self.cur].m;
+                            let sm = self.moves[self.cur];
                             self.cur += 1;
-                            return Some(m);
+                            self.cached_gives_check = sm.gives_check;
+                            return Some(sm.m);
                         }
                         // Bad quiet - swap to the front of the quiet span for later
                         self.moves.swap(self.end_bad_quiets, self.cur);
@@ -1190,15 +1386,17 @@ impl StagedMoveGen {
                     }
 
                     if self.cur < self.end_bad_quiets {
-                        let m = self.moves[self.cur].m;
+                        let sm = self.moves[self.cur];
                         self.cur += 1;
-                        return Some(m);
+                        self.cached_gives_check = sm.gives_check;
+                        return Some(sm.m);
                     }
 
                     self.stage = MoveStage::Done;
                 }
 
                 MoveStage::EvasionInit => {
+                    self.ensure_cont_history_indices(searcher);
                     self.generate_evasions(game, searcher);
                     self.end_generated = self.moves.len();
                     self.cur = 0;
@@ -1210,9 +1408,10 @@ impl StagedMoveGen {
 
                 MoveStage::Evasion | MoveStage::QCapture => {
                     if self.cur < self.end_generated.max(self.end_captures) {
-                        let m = self.moves[self.cur].m;
+                        let sm = self.moves[self.cur];
                         self.cur += 1;
-                        return Some(m);
+                        self.cached_gives_check = sm.gives_check;
+                        return Some(sm.m);
                     }
                     self.stage = MoveStage::Done;
                 }
@@ -1420,13 +1619,13 @@ mod tests {
             .find(|m| m.piece.piece_type() == PieceType::King && (m.to.x - m.from.x).abs() == 2)
             .expect("kingside castling should be legal");
         assert!(
-            castle.partner_coord.is_some(),
+            castle.partner_x != crate::moves::NO_PARTNER,
             "generated castling has a partner"
         );
 
         // Simulate the TT/killer round-trip, which drops the rook partner.
         let tt_decoded = Move {
-            partner_coord: None,
+            partner_x: crate::moves::NO_PARTNER,
             ..castle
         };
 
@@ -1438,7 +1637,7 @@ mod tests {
             if m.from == castle.from && m.to == castle.to {
                 found = true;
                 assert!(
-                    m.partner_coord.is_some(),
+                    m.partner_x != crate::moves::NO_PARTNER,
                     "emitted castling move lost its rook partner"
                 );
             }
@@ -1540,16 +1739,16 @@ mod tests {
 
         searcher.killers[0][0] = Some(quiet);
         let picker = StagedMoveGen::new(None, 0, 2, &searcher, &game);
-        assert_eq!(picker.score_quiet(&game, &searcher, &quiet), sort_killer1());
+        assert_eq!(picker.score_quiet(&game, &searcher, &quiet).0, sort_killer1());
 
         let mut searcher = Searcher::new(1000);
         searcher.prev_move_stack[0] = (3, 9);
-        searcher.countermoves[3][9] = (
+        searcher.countermoves[crate::search::hist_color(quiet.piece.color())][3][9] = (
             quiet.piece.piece_type() as u8,
             quiet.to.x as i32,
             quiet.to.y as i32,
         );
         let picker = StagedMoveGen::new(None, 1, 2, &searcher, &game);
-        assert!(picker.score_quiet(&game, &searcher, &quiet) >= sort_countermove());
+        assert!(picker.score_quiet(&game, &searcher, &quiet).0 >= sort_countermove());
     }
 }

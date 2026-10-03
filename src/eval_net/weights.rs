@@ -1,0 +1,239 @@
+//! Quantized eval-net weights, embedded at compile time. An empty or
+//! schema-mismatched blob simply disables the net; the engine never fails open.
+
+use once_cell::sync::Lazy;
+use std::io::{Cursor, Read};
+
+const MAGIC: &[u8; 8] = b"AEVNET01";
+
+/// i16 buffer whose payload starts on a 64-byte boundary, so every 32-byte
+/// weight load stays inside one cache line.
+pub struct AlignedI16 {
+    data: Box<[i16]>,
+    off: usize,
+}
+
+impl AlignedI16 {
+    pub fn zeroed(len: usize) -> Self {
+        let data: Box<[i16]> = vec![0i16; len + 32].into_boxed_slice();
+        let off = (64 - (data.as_ptr() as usize % 64)) % 64 / 2;
+        AlignedI16 { data, off }
+    }
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[i16] {
+        &self.data[self.off..]
+    }
+    pub fn as_mut_slice(&mut self) -> &mut [i16] {
+        &mut self.data[self.off..]
+    }
+    pub fn from_rows(rows: &[i16], n_in: usize, stride: usize, n_rows: usize) -> Self {
+        let mut out = Self::zeroed(stride * n_rows);
+        for r in 0..n_rows {
+            out.as_mut_slice()[r * stride..r * stride + n_in]
+                .copy_from_slice(&rows[r * n_in..(r + 1) * n_in]);
+        }
+        out
+    }
+}
+
+/// The first `len` weights of `w` as i8; every stored weight is in i8 range.
+#[cfg(target_arch = "x86_64")]
+pub fn narrow(w: &AlignedI16, len: usize) -> Box<[i8]> {
+    w.as_slice()[..len].iter().map(|&v| v as i8).collect()
+}
+
+/// Row strides are padded to 32 i16 (64 bytes) so aligned rows stay aligned.
+pub const fn pad32(n: usize) -> usize {
+    n.div_ceil(32) * 32
+}
+
+pub struct EvalNetWeights {
+    /// Blob version 2+: inputs are re-encoded as (side to move, opponent) and the
+    /// output is side-to-move relative.
+    pub perspective: bool,
+    pub n_in: usize,
+    pub h1: usize,
+    pub h2: usize,
+    /// Padded row strides of `l1_w` (inputs) and `l2_w` (layer-1 outputs).
+    pub stride1: usize,
+    pub stride2: usize,
+    /// Right-shifts applied to the layer-1/2 accumulators before the CReLU.
+    pub s1: u32,
+    pub s2: u32,
+    /// Converts the raw integer output to centipawns.
+    pub out_scale: f32,
+    /// Weights are i8 on disk but widened to i16 at load: pmaddwd then needs no
+    /// sign-extension step, and the 66 KB of layer 1 streams fine from L2.
+    pub l1_w: AlignedI16,
+    pub l1_b: Box<[i32]>,
+    pub l2_w: AlignedI16,
+    /// `l2_w` again as i8: layer-1 activations are 0..=127, so layer 2 can use
+    /// u8 x i8 pair products, which never saturate i16 (2 * 127 * 127 < 32768).
+    #[cfg(target_arch = "x86_64")]
+    pub l2_w8: Box<[i8]>,
+    pub l2_b: Box<[i32]>,
+    pub l3_w: AlignedI16,
+    pub l3_b: i32,
+}
+
+fn read_u32(c: &mut Cursor<&[u8]>) -> Result<u32, &'static str> {
+    let mut b = [0u8; 4];
+    c.read_exact(&mut b).map_err(|_| "short read (u32)")?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn read_u64(c: &mut Cursor<&[u8]>) -> Result<u64, &'static str> {
+    let mut b = [0u8; 8];
+    c.read_exact(&mut b).map_err(|_| "short read (u64)")?;
+    Ok(u64::from_le_bytes(b))
+}
+
+fn read_f32(c: &mut Cursor<&[u8]>) -> Result<f32, &'static str> {
+    let mut b = [0u8; 4];
+    c.read_exact(&mut b).map_err(|_| "short read (f32)")?;
+    Ok(f32::from_le_bytes(b))
+}
+
+fn read_i8s(c: &mut Cursor<&[u8]>, n: usize) -> Result<Box<[i16]>, &'static str> {
+    let mut buf = vec![0u8; n];
+    c.read_exact(&mut buf).map_err(|_| "short read (i8[])")?;
+    Ok(buf.into_iter().map(|b| b as i8 as i16).collect())
+}
+
+fn read_i32s(c: &mut Cursor<&[u8]>, n: usize) -> Result<Box<[i32]>, &'static str> {
+    let mut buf = vec![0u8; n * 4];
+    c.read_exact(&mut buf).map_err(|_| "short read (i32[])")?;
+    Ok(buf
+        .chunks_exact(4)
+        .map(|ch| i32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]))
+        .collect())
+}
+
+impl EvalNetWeights {
+    /// Parses a blob that must carry `want_n` inputs sealed with `want_schema`.
+    pub fn from_bytes(data: &[u8], want_n: usize, want_schema: u64) -> Result<Self, &'static str> {
+        let mut c = Cursor::new(data);
+        let mut magic = [0u8; 8];
+        c.read_exact(&mut magic).map_err(|_| "short read (magic)")?;
+        if &magic != MAGIC {
+            return Err("bad magic");
+        }
+        let version = read_u32(&mut c)?;
+        let n_in = read_u32(&mut c)? as usize;
+        let h1 = read_u32(&mut c)? as usize;
+        let h2 = read_u32(&mut c)? as usize;
+        let s1 = read_u32(&mut c)?;
+        let s2 = read_u32(&mut c)?;
+        let schema = read_u64(&mut c)?;
+        let out_scale = read_f32(&mut c)?;
+
+        if n_in != want_n {
+            return Err("feature count mismatch");
+        }
+        if schema != want_schema {
+            return Err("schema hash mismatch");
+        }
+        if h1 == 0 || h2 == 0 || !h1.is_multiple_of(16) || !h2.is_multiple_of(16) {
+            return Err("bad hidden dims");
+        }
+
+        let (stride1, stride2) = (pad32(n_in), pad32(h1));
+        let l1 = read_i8s(&mut c, h1 * n_in)?;
+        let l1_b = read_i32s(&mut c, h1)?;
+        let l2 = read_i8s(&mut c, h2 * h1)?;
+        let l2_b = read_i32s(&mut c, h2)?;
+        let l3 = read_i8s(&mut c, h2)?;
+        let l3_b = read_i32s(&mut c, 1)?[0];
+        Ok(EvalNetWeights {
+            perspective: version >= 2,
+            n_in,
+            h1,
+            h2,
+            stride1,
+            stride2,
+            s1,
+            s2,
+            out_scale,
+            l1_w: AlignedI16::from_rows(&l1, n_in, stride1, h1),
+            l1_b,
+            l2_w: AlignedI16::from_rows(&l2, h1, stride2, h2),
+            #[cfg(target_arch = "x86_64")]
+            l2_w8: narrow(&AlignedI16::from_rows(&l2, h1, stride2, h2), stride2 * h2),
+            l2_b,
+            l3_w: AlignedI16::from_rows(&l3, h2, pad32(h2), 1),
+            l3_b,
+        })
+    }
+}
+
+/// Trained weights blob; regenerate with `evalnet/export_eval_net.py`. An empty
+/// file is a valid "no net yet" state.
+static EVAL_NET_BYTES: &[u8] = include_bytes!("eval_net.bin");
+
+pub static EVAL_NET: Lazy<Option<EvalNetWeights>> = Lazy::new(|| {
+    use super::features::{
+        KEXP_INPUTS, NET_INPUTS, NUM_FEATURES, TYPE_NET_INPUTS, net_schema_hash, ray_net_schema_hash,
+        schema_hash, type_net_schema_hash,
+    };
+    // The base vector, plus the king-exposure inputs, plus the slider-ray ones, by header width.
+    let n_in = EVAL_NET_BYTES.get(12..16).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    if n_in == Some(TYPE_NET_INPUTS) {
+        parse(EVAL_NET_BYTES, TYPE_NET_INPUTS, type_net_schema_hash())
+    } else if n_in == Some(NET_INPUTS) {
+        parse(EVAL_NET_BYTES, NET_INPUTS, ray_net_schema_hash())
+    } else if n_in == Some(NUM_FEATURES + KEXP_INPUTS) {
+        parse(EVAL_NET_BYTES, NUM_FEATURES + KEXP_INPUTS, net_schema_hash())
+    } else {
+        parse(EVAL_NET_BYTES, NUM_FEATURES, schema_hash())
+    }
+});
+
+/// Nets for the specialized evaluators, each over its own evaluator's layout, residual
+/// added to that evaluator's score. Empty files mean no net.
+pub static CHESS_NET: Lazy<Option<EvalNetWeights>> =
+    Lazy::new(|| parse_layout(include_bytes!("chess_net.bin"), &variants::chess::NET_LAYOUT));
+pub static OBSTOCEAN_NET: Lazy<Option<EvalNetWeights>> = Lazy::new(|| {
+    parse_layout(include_bytes!("obstocean_net.bin"), &variants::obstocean::NET_LAYOUT)
+});
+pub static PAWN_HORDE_NET: Lazy<Option<EvalNetWeights>> = Lazy::new(|| {
+    parse_layout(include_bytes!("pawn_horde_net.bin"), &variants::pawn_horde::NET_LAYOUT)
+});
+
+use crate::evaluation::variants;
+
+fn parse_layout(bytes: &[u8], layout: &super::variant_features::VariantLayout) -> Option<EvalNetWeights> {
+    parse(bytes, layout.len(), layout.schema_hash())
+}
+
+fn parse(bytes: &[u8], want_n: usize, want_schema: u64) -> Option<EvalNetWeights> {
+    if bytes.is_empty() {
+        return None;
+    }
+    match EvalNetWeights::from_bytes(bytes, want_n, want_schema) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            #[cfg(not(target_arch = "wasm32"))]
+            eprintln!("eval_net: weights rejected ({e}), net disabled");
+            let _ = e;
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_bad_magic_and_short_data() {
+        assert!(EvalNetWeights::from_bytes(b"BADMAGIC", 1, 0).is_err());
+        assert!(EvalNetWeights::from_bytes(b"AEVNET01", 1, 0).is_err());
+    }
+
+    /// A schema or width mismatch loads no net at all, silently: the engine would play on
+    /// the bare HCE.
+    #[test]
+    fn embedded_net_loads() {
+        assert!(EVAL_NET.is_some());
+    }
+}

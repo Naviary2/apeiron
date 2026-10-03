@@ -6,6 +6,7 @@ pub mod eval_kind;
 pub mod helpers;
 pub mod insufficient_material;
 pub mod mop_up;
+pub mod params;
 pub mod piece_reach;
 pub mod variants;
 
@@ -23,7 +24,7 @@ pub use base::{
 const RULE50_DAMP_CAP: i32 = 700;
 
 #[cfg(any(feature = "param_tuning", feature = "eval_tuning"))]
-pub use crate::search::params::{
+pub use crate::evaluation::params::{
     EVAL_PARAMS, EvalParamSpec, EvalParams, TUNABLE_EVAL_PARAM_SPECS, get_eval_params_as_json,
     set_eval_params, set_eval_params_from_json,
 };
@@ -92,6 +93,13 @@ fn bounded_drawish_scale_inner(game: &GameState, eval: i32, world_size: i64) -> 
     if eval == 0 || world_size > 200 {
         return eval;
     }
+    // "Drawn with correct defense" is checkmate reasoning; under capture-all
+    // the same extra rook is a plain win.
+    if game.game_rules.white_win_condition != crate::game::WinCondition::Checkmate
+        || game.game_rules.black_win_condition != crate::game::WinCondition::Checkmate
+    {
+        return eval;
+    }
     if game.white_royals.len() != 1 || game.black_royals.len() != 1 {
         return eval;
     }
@@ -107,7 +115,8 @@ fn bounded_drawish_scale_inner(game: &GameState, eval: i32, world_size: i64) -> 
     let (mut w_pawns, mut b_pawns) = (false, false);
     for (_, _, piece) in game.board.iter() {
         let pt = piece.piece_type();
-        if pt.is_royal() {
+        // Obstacles are scenery, not material: they must not abort the scan.
+        if pt.is_royal() || piece.color() == PlayerColor::Neutral {
             continue;
         }
         let white = piece.color() == PlayerColor::White;
@@ -179,50 +188,43 @@ fn apply_rule50_damping(game: &GameState, raw_eval: i32, mop_up_active: bool) ->
     }
 }
 
-/// Main evaluation entry point - NNUE Enabled
+/// A specialized evaluator's score plus its net's residual, side-to-move relative. The
+/// evaluator's own pass writes the net's inputs, so the net costs no second eval.
 #[inline]
-#[cfg(feature = "nnue")]
-pub fn evaluate(game: &GameState, nnue_state: Option<&crate::nnue::NnueState>) -> i32 {
-    if insufficient_material::evaluate_insufficient_material(game) {
-        return 0;
-    }
-    let raw_eval = match game.eval_kind {
-        EvalKind::Chess => variants::chess::evaluate(game),
-        EvalKind::Obstocean => variants::obstocean::evaluate(game),
-        EvalKind::PawnHorde => variants::pawn_horde::evaluate(game),
-        EvalKind::Generic => {
-            // Try NNUE first if applicable (standard pieces, kings present, weights loaded)
-            if crate::nnue::is_applicable(game) {
-                if let Some(state) = nnue_state {
-                    crate::nnue::evaluate_with_state(game, state)
-                } else {
-                    crate::nnue::evaluate(game)
-                }
-            } else {
-                base::evaluate(game)
-            }
-        }
+fn variant_eval(game: &GameState) -> i32 {
+    use crate::eval_net::variant_features::{VariantFeatures, VariantLayout};
+    let plain = |g: &GameState| match g.eval_kind {
+        EvalKind::Chess => variants::chess::evaluate(g),
+        EvalKind::Obstocean => variants::obstocean::evaluate(g),
+        _ => variants::pawn_horde::evaluate(g),
     };
-    let mop_up = compute_mop_up_term(game);
-
-    apply_rule50_damping(
-        game,
-        apply_pawnless_scale(game, apply_bounded_drawish_scale(game, raw_eval + mop_up)),
-        mop_up != 0,
-    )
+    let Some(net) = crate::eval_net::variant_net(game.eval_kind) else {
+        return plain(game);
+    };
+    if base::net_off(game) {
+        return plain(game);
+    }
+    let mut f = VariantFeatures::default();
+    let (score, layout): (i32, &VariantLayout) = match game.eval_kind {
+        EvalKind::Chess => (variants::chess::evaluate_traced(game, &mut f), &variants::chess::NET_LAYOUT),
+        EvalKind::Obstocean => {
+            (variants::obstocean::evaluate_traced(game, &mut f), &variants::obstocean::NET_LAYOUT)
+        }
+        _ => (variants::pawn_horde::evaluate_traced(game, &mut f), &variants::pawn_horde::NET_LAYOUT),
+    };
+    let black = game.turn == PlayerColor::Black;
+    let r = crate::eval_net::variant_residual(net, layout, &f, black);
+    score + if black { -r } else { r }
 }
 
-/// Main evaluation entry point - NNUE Disabled
+/// Main evaluation entry point.
 #[inline]
-#[cfg(not(feature = "nnue"))]
 pub fn evaluate(game: &GameState) -> i32 {
     if insufficient_material::evaluate_insufficient_material(game) {
         return 0;
     }
     let raw_eval = match game.eval_kind {
-        EvalKind::Chess => variants::chess::evaluate(game),
-        EvalKind::Obstocean => variants::obstocean::evaluate(game),
-        EvalKind::PawnHorde => variants::pawn_horde::evaluate(game),
+        EvalKind::Chess | EvalKind::Obstocean | EvalKind::PawnHorde => variant_eval(game),
         EvalKind::Generic => base::evaluate(game),
     };
     let mop_up = compute_mop_up_term(game);
@@ -252,10 +254,35 @@ mod tests {
 
     #[inline]
     fn evaluate_wrapper(game: &GameState) -> i32 {
-        #[cfg(feature = "nnue")]
-        return evaluate(game, None);
-        #[cfg(not(feature = "nnue"))]
-        return evaluate(game);
+        evaluate(game)
+    }
+
+    /// With no royals the cloud reference fell back to the absolute origin, and
+    /// since offsets from it are clamped, translating a kingless position changed
+    /// its score. Shape, not location, is what the cloud terms mean to measure.
+    #[test]
+    fn kingless_evaluation_is_translation_invariant() {
+        let near = create_test_game_from_icn("w allpiecescaptured N1,2|N2,3|r10,5");
+        let far = create_test_game_from_icn("w allpiecescaptured N101,102|N102,103|r110,105");
+        assert_eq!(base::evaluate(&near), base::evaluate(&far));
+    }
+
+    /// The bounded rook/minor "drawn with correct defense" scale is checkmate
+    /// reasoning. Under capture-all the extra minor is a plain win, so applying
+    /// it there discounted a winning score eightfold.
+    #[test]
+    fn bounded_drawish_scale_does_not_apply_to_capture_all() {
+        let checkmate =
+            create_test_game_from_icn("w 0/100 1 (8|1) 1,8,1,8 K1,1|R2,2|N3,3|k8,8|r7,7");
+        let capture_all = create_test_game_from_icn(
+            "w 0/100 1 (8|1) 1,8,1,8 allpiecescaptured,allpiecescaptured K1,1|R2,2|N3,3|k8,8|r7,7",
+        );
+        let scaled = evaluate_wrapper(&checkmate);
+        let unscaled = evaluate_wrapper(&capture_all);
+        assert!(
+            unscaled.abs() > scaled.abs(),
+            "capture-all must keep the full score ({unscaled}) that checkmate rules damp ({scaled})"
+        );
     }
 
     #[test]

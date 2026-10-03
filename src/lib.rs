@@ -3,10 +3,11 @@ use wasm_bindgen::prelude::*;
 
 pub mod attacks;
 pub mod board;
+pub mod eval_net;
 pub mod evaluation;
 pub mod game;
 pub mod moves;
-pub mod nnue;
+pub mod rights;
 pub mod search;
 pub mod simd;
 pub mod tiles;
@@ -52,7 +53,7 @@ pub enum Variant {
 }
 
 impl Variant {
-    #[cfg(any(test, not(target_arch = "wasm32")))]
+    #[cfg(any(test, not(target_arch = "wasm32"), feature = "bench_positions"))]
     pub fn starting_icn(&self) -> &'static str {
         match self {
             Variant::Classical => {
@@ -281,7 +282,10 @@ pub struct JsMoveWithEval {
     pub to: String,   // "x,y"
     pub promotion: Option<String>,
     pub eval: i32,    // centipawn score from side-to-move's perspective
-    pub depth: usize, // depth reached
+    pub depth: usize, // depth limit requested
+    /// Depth the calling thread completed, and nodes summed over every search thread.
+    pub completed_depth: usize,
+    pub nodes: u64,
 }
 
 #[cfg(any(feature = "param_tuning", feature = "eval_tuning"))]
@@ -316,16 +320,17 @@ pub struct JsEngineConfig {
 pub struct JsAnalyseOptions {
     /// Number of principal variations to search (1..=legal move count).
     pub multi_pv: Option<usize>,
-    /// Depth cap for this analysis (defaults to 50).
+    /// Depth cap for this analysis (defaults to the maximum, [`search::MAX_PLY`]).
     pub max_depth: Option<usize>,
     /// Depth to resume iterative deepening at (defaults to 1). Pass `last_reached + 1`
     /// on successive slices of the same position so the search keeps deepening instead
     /// of re-walking from depth 1.
     pub start_depth: Option<usize>,
-    /// Time budget of this slice in milliseconds; 0 or absent runs until `max_depth`
-    /// completes. Unlimited slices are deterministic, since no wall-clock abort can
-    /// vary the search tree between runs.
+    /// Time budget of this slice in milliseconds, a hard limit that may cut a depth short
+    /// (only completed depths are reported); 0 or absent runs until `max_depth` completes.
     pub slice_ms: Option<u64>,
+    /// Node budget per search thread, a hard limit like `slice_ms`. Only applies without one.
+    pub max_nodes: Option<u64>,
 }
 
 /// One principal variation of an analysis update.
@@ -574,9 +579,6 @@ impl Engine {
     #[wasm_bindgen]
     pub fn evaluate_with_features(&mut self) -> JsValue {
         crate::evaluation::reset_eval_features();
-        #[cfg(feature = "nnue")]
-        let eval = crate::evaluation::evaluate(&self.game, None);
-        #[cfg(not(feature = "nnue"))]
         let eval = crate::evaluation::evaluate(&self.game);
         let features = crate::evaluation::snapshot_eval_features();
         serde_wasm_bindgen::to_value(&JsEvalWithFeatures { eval, features }).unwrap()
@@ -617,6 +619,7 @@ impl Engine {
         const LOW_CLOCK_SURVIVE_INC_MULT: u64 = 6;
         const LOW_CLOCK_SURVIVE_FRAC: f64 = 0.9;
 
+        crate::search::set_clock_cap_ms(u64::MAX);
         let Some(clock) = self.clock else {
             // No clock info: use the fixed per-move limit as a soft limit.
             // The search can use up to this time freely without flagging risk.
@@ -733,6 +736,7 @@ impl Engine {
 
         // Final safety cap: never exceed 82.5% of remaining time
         let absolute_cap = ((remaining_ms as f64) * 0.825 - move_overhead as f64) as u64;
+        crate::search::set_clock_cap_ms(absolute_cap.max(min_think_ms));
         let optimum = optimum.min(absolute_cap.max(min_think_ms));
         let maximum = maximum.min(absolute_cap.max(min_think_ms));
 
@@ -825,9 +829,9 @@ impl Engine {
         search::set_global_params(effective_seed, noise_amp);
 
         // Choose search path based on strength level.
-        let (best_move, eval) = if strength.is_some_and(|s| s < crate::search::MAX_SITE_SKILL) {
+        let (best_move, eval, nodes) = if strength.is_some_and(|s| s < crate::search::MAX_SITE_SKILL) {
             // Use strength limited search (uses global seed we just set)
-            if let Some((bm, ev, _stats)) = search::get_best_move_limited(
+            if let Some((bm, ev, stats)) = search::get_best_move_limited(
                 &mut self.game,
                 depth,
                 opt_time,
@@ -836,13 +840,13 @@ impl Engine {
                 silent,
                 is_soft_limit,
             ) {
-                (bm, ev)
+                (bm, ev, stats.nodes)
             } else {
                 return JsValue::NULL;
             }
         } else {
             // Normal search: use parallel version (handles both single and multi-threaded)
-            if let Some((bm, ev, _stats)) = search::get_best_move_parallel(
+            if let Some((bm, ev, stats)) = search::get_best_move_parallel(
                 &mut self.game,
                 depth,
                 opt_time,
@@ -850,7 +854,7 @@ impl Engine {
                 silent,
                 is_soft_limit,
             ) {
-                (bm, ev)
+                (bm, ev, stats.nodes)
             } else {
                 return JsValue::NULL;
             }
@@ -862,6 +866,8 @@ impl Engine {
             promotion: best_move.promotion.map(|p| p.to_str().to_string()),
             eval,
             depth,
+            completed_depth: search::get_completed_depth(),
+            nodes,
         };
         serde_wasm_bindgen::to_value(&js_move).unwrap()
     }
@@ -942,10 +948,13 @@ impl Engine {
                 max_depth: None,
                 start_depth: None,
                 slice_ms: None,
+                max_nodes: None,
             },
         };
+        search::set_node_limit(options.max_nodes.unwrap_or(0));
         let multi_pv = options.multi_pv.unwrap_or(1).clamp(1, 16);
-        let max_depth = options.max_depth.unwrap_or(50).clamp(1, 64);
+        #[rustfmt::skip]
+        let max_depth = options.max_depth.unwrap_or(search::MAX_PLY).clamp(1, search::MAX_PLY);
         let start_depth = options.start_depth.unwrap_or(1).clamp(1, max_depth);
         let slice_ms = match options.slice_ms.unwrap_or(0) {
             0 => u128::MAX, // Unlimited: run until max_depth completes (deterministic).
@@ -963,8 +972,8 @@ impl Engine {
         // worker's JS yields, and retire only when the epoch bumps.
         #[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
         {
-            // Helpers = pool size - 1, capped at 3: the site exposes up to 4 analysis threads.
-            let num_threads = rayon::current_num_threads().max(1).min(4);
+            // Helpers = pool size - 1; the page sizes the pool, so no engine-side cap.
+            let num_threads = rayon::current_num_threads().max(1);
             if num_threads > 1 {
                 search::init_shared_tt();
                 search::USE_SHARED_TT.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -979,11 +988,13 @@ impl Engine {
                     search::GLOBAL_STOP.store(false, std::sync::atomic::Ordering::Relaxed);
                     for i in 1..num_threads {
                         let game_clone = self.game.clone();
-                        rayon::spawn(move || search::helper_run(game_clone, epoch, i));
+                        rayon::spawn(move || {
+                            search::helper_run(game_clone, epoch, i, max_depth, multi_pv)
+                        });
                     }
                 }
 
-                let result = search::analyse_position(
+                let mut result = search::analyse_position(
                     &mut self.game,
                     max_depth,
                     start_depth,
@@ -991,6 +1002,7 @@ impl Engine {
                     multi_pv,
                     &mut callback,
                 );
+                search::vote_analysis_lines(&mut result);
                 return self.analysis_result_to_js(&result);
             }
         }
@@ -1012,7 +1024,9 @@ impl Engine {
 
     /// Returns all legal moves as a JS array of {from: "x,y", to: "x,y", promotion: string|null}
     pub fn get_legal_moves_js(&mut self) -> JsValue {
-        let pseudo_legal = self.game.get_pseudo_legal_moves();
+        // Filtering cannot recover a move the cached candidate list omitted.
+        let mut pseudo_legal = moves::MoveList::new();
+        self.game.get_pseudo_legal_moves_into(&mut pseudo_legal);
         let mut legal_moves: Vec<JsMove> = Vec::new();
 
         for m in pseudo_legal {
@@ -1062,10 +1076,7 @@ impl Engine {
     /// Return the engine's static evaluation of the current position in centipawns,
     /// from the side-to-move's perspective (positive = advantage for side to move).
     pub fn evaluate_position(game: &GameState) -> i32 {
-        #[cfg(feature = "nnue")]
-        return crate::evaluation::evaluate(game, None);
-        #[cfg(not(feature = "nnue"))]
-        return crate::evaluation::evaluate(game);
+        crate::evaluation::evaluate(game)
     }
 }
 

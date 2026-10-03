@@ -72,10 +72,16 @@ fills with stray `games_*.json` that later have to be swept up by hand. That
 corpus is reused by `puzzle_gen`/`texel` as training data, so keeping every run
 in one place is what makes it worth anything.
 
-`--concurrency` defaults to physical core count (`num_cpus::get_physical()`), not logical —
-each game is single-threaded, so SMT siblings only add contention, not real parallelism.
-Passing a manual `--concurrency` above physical core count reproduces the same timeout
-inflation as the zombie incident below, without needing any zombies to cause it.
+`--concurrency` defaults to the physical core count, which leaves throughput unused. Pass
+about 80% of the logical cores (`--concurrency 12` on this 16-thread box). Only go higher
+if the timeout rate stays at a few percent.
+
+## 3b. HCE changes: screen offline first
+
+An eval-term change is tested with its own retrained net, against HEAD as committed.
+Before building that, run the offline screen (`evalnet/screen.sh`, see docs/CONTRIBUTING.md
+"Changing the Evaluation"): compare 3+ seed mean holdout losses with HEAD's. Use it to pick
+between variants of an idea; drop a change unseen only when it is clearly worse (~1%+).
 
 ## 4. Scope variants to what the change touches
 
@@ -103,10 +109,10 @@ bounds are draw-rate/TC independent — pick them by the change's intent:
 
 | Scenario | Bounds | Meaning |
 |----------|--------|---------|
-| Gainer, short TC (default new feature/tune) | `--elo0 0 --elo1 2` | prove a real gain |
-| Gainer, long TC | `--elo0 0.5 --elo1 2.5` | gain that survives depth |
-| Simplification / refactor / cleanup (prove NOT a regression) | `--elo0 -1.75 --elo1 0.25` | accept small losses, reject real ones |
-| Risky rewrite where a tiny loss is unacceptable | `--elo0 -0.5 --elo1 1.5` | tight non-regression |
+| Gainer, short TC (default new feature/tune) | `--elo0 0 --elo1 5` | prove a real gain |
+| Gainer, long TC | `--elo0 1 --elo1 6` | gain that survives depth |
+| Simplification / refactor / cleanup (prove NOT a regression) | `--elo0="-10" --elo1 0` | accept small losses, reject real ones |
+| Risky rewrite where a tiny loss is unacceptable | `--elo0="-8" --elo1 0` | tight non-regression |
 
 Keep α=β=0.05 (⇒ LLR decision bounds ≈ **[−2.94, +2.94]**). Adjudication stays OFF.
 Use `--model logistic` only to reproduce old-style raw-Elo bounds — do not mix scales.
@@ -119,6 +125,7 @@ own — the batch size is just the cap for the undecided case.
 
 | Scope | Initial `--max-games` | Follow-up (`--resume`, if still undecided) |
 |-------|----------------------|--------------------------------------------|
+| Single variant | 1000 | +1000 |
 | Scoped (few variants) | 1500 | +1500 |
 | Whole engine (`site`) | 2500 | +2500 |
 
@@ -144,21 +151,21 @@ Extend only when it pays off — decide from |LLR| at the end of a batch (§8). 
   to strand zombies: the wrapper returns, the match keeps running unsupervised.)
 - **NEVER set a watch/monitor/poll loop on a running SPRT, and never sleep waiting on one.** The
   background task auto-notifies on completion — just END THE TURN after launching. Extra watchers
-  burn a core (the match is already sized to the physical cores), add nothing, and a polling loop
+  burn a core (the match already fills the machine), add nothing, and a polling loop
   is the same oversubscription that fakes regressions. Same rule for the post-launch "is it really
   running" check: one glance at the output file is fine, a loop is not.
 - **Let the run FINISH (or `--resume` it to completion) before quoting numbers** — the
   `Final Summary` block and the `--results` JSON are only written at the end. Killing early leaves
   you with no per-variant breakdown to paste into the commit (§9).
-- **Negative bounds MUST use `="..."` syntax** (`--elo0="-1.75"`), else clap parses `-1.75` as a
-  flag (`unexpected argument '-1'`) AND the shell can mangle it. Always quote: `--elo0="-1.75" --elo1="0.25"`.
+- **Negative bounds MUST use `="..."` syntax** (`--elo0="-10"`), else clap parses `-10` as a
+  flag (`unexpected argument '-1'`) AND the shell can mangle it. Always quote: `--elo0="-10" --elo1 0`.
 - Standard invocation:
   ```
   ./target/release/sprt.exe run \
     --old-bin "<REPO>/sprt_old.exe" [--new-bin "<REPO>/base_new.exe"] \
     --old-commit <sha> --new-commit <label> \
     --variants "<scoped,list>" \
-    --elo0 <lo> --elo1 <hi> \
+    --elo0 <lo> --elo1 <hi> --concurrency 12 \
     --games "<REPO>/games/sprt/games_<tag>.json" --results "<REPO>/games/sprt/results_<tag>.json" \
     --max-games <N>
   ```
@@ -173,23 +180,23 @@ scaled to risk, while rejecting is cheap (you just don't ship), so abandon loser
 
 | Change type | Accept when LLR ≥ |
 |-------------|-------------------|
-| Simple / low-risk / trivially reversible (cleanup, small tweak, obvious speedup) | **+1.0** |
-| Normal | **+2.94** |
+| Simple / low-risk / trivially reversible (cleanup, small tweak, obvious speedup) | **+1.5** |
+| Normal | **+2.0** |
 | Risky / has revert history / hard to verify (search reworks, multi-royal, TT) | **+2.94** AND clean per-variant breakdown |
 
-**Reject threshold (any gainer test):** LLR ≤ **−0.5** → revert. No need to prove a loss to
-95%; stop burning games on it. (Simplification tests use their own `[-1.75, 0.25]` bounds)
+**Reject threshold (any gainer test):** LLR ≤ **−1.0** → revert. No need to prove a loss to
+95%; stop burning games on it. (Simplification tests use their own `[-10, 0]` bounds)
 
 **Extend vs stop — from |LLR| at end of a batch:**
 
-- **|LLR| ≥ 1.0**, heading toward a bound → almost there; let it finish / one small follow-up.
-  If a follow-up finishes and LLR is STILL ≥ +1.0 (even short of +2.94), accept — it has
+- **|LLR| ≥ 1.5**, heading toward a bound → almost there; let it finish / one small follow-up.
+  If a follow-up finishes and LLR is STILL ≥ +1.5 (even short of +2.94), accept — it has
   already survived more games without dropping below the accept line.
-- **0.5 ≤ |LLR| < 1.0** → genuinely undecided; this is where games pay off → run a full follow-up.
-- **|LLR| < 0.5** after the initial batch, still < 0.5 after one follow-up → effectively
+- **0.75 ≤ |LLR| < 1.5** → genuinely undecided; this is where games pay off → run a full follow-up.
+- **|LLR| < 0.75** after the initial batch, still < 0.75 after one follow-up → effectively
   **neutral** (a flat LLR won't move with more games — stop). Decide by intent: **accept
   simplifications** (free simplicity), **reject gainers** (complexity for no gain).
-- **Neutrality cap:** stop chasing after ~2 follow-ups with |LLR| < 1.0.
+- **Neutrality cap:** stop chasing after ~2 follow-ups with |LLR| < 1.5.
 
 **Large-sample override:** at **≥4000 total games**, a solidly positive point estimate is
 enough on its own — accept if nElo/Elo is clearly positive (e.g. ≥ +5 Elo-equivalent) and its
@@ -213,6 +220,8 @@ block **verbatim** — do NOT hand-condense it. `.github/workflows/auto-release.
 commit body with a regex that requires each variant on its own `[Name]: …, Elo: X +/- Y` line;
 a condensed multi-per-line summary (no brackets) is invisible to it and silently breaks
 auto-release. **No AI attribution / Co-Authored-By / "Generated with" trailer.**
+A commit that ships several separately tested pieces stacks their `Final Summary` blocks;
+auto-release merges them per variant, a later block overriding an earlier one.
 
 Correct — paste exactly what `sprt.exe` printed:
 ```

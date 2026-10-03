@@ -1,7 +1,6 @@
 //! Sparse 8x8 tiled bitboards. Each tile holds u64 occupancy bitboards alongside
 //! packed piece arrays.
 
-pub mod magic;
 pub mod masks;
 
 use crate::board::{Piece, PlayerColor};
@@ -16,6 +15,12 @@ pub const TILE_MASK: i64 = TILE_SIZE - 1; // 0b111 = 7
 /// TileTable starting capacity (power of 2). Every position the engine actually
 /// plays fits well inside this, so the table never reallocates in normal play.
 pub const TILE_TABLE_INITIAL_CAPACITY: usize = 512;
+
+/// Side of the square block of tiles around the origin that `dense` maps straight
+/// to slots, skipping the hash (256x256 squares). Kept at the origin: a movable one
+/// measured ~0.7% slower on this hot lookup, more than recentring it earns.
+const DENSE_TILES: i64 = 32;
+const DENSE_NONE: u32 = u32::MAX;
 
 // Tile Coordinate Math
 
@@ -358,6 +363,9 @@ pub struct TileTable {
     tiles: Box<[Tile]>,
     /// BITBOARD: Bitmask of occupied slots, `capacity / 64` words.
     occ_mask: Box<[u64]>,
+    /// Slot of each tile inside the dense block, or `DENSE_NONE`. A pure index over
+    /// the hash layout: slots and their order are exactly what probing assigns.
+    dense: Box<[u32]>,
 }
 
 impl Default for TileTable {
@@ -384,6 +392,25 @@ impl TileTable {
             // Boxed slice rather than an array: 512 tiles is ~96 KiB of stack.
             tiles: vec![Tile::new(); capacity].into_boxed_slice(),
             occ_mask: vec![0u64; capacity / 64].into_boxed_slice(),
+            dense: vec![DENSE_NONE; (DENSE_TILES * DENSE_TILES) as usize].into_boxed_slice(),
+        }
+    }
+
+    #[inline(always)]
+    fn dense_index(cx: i64, cy: i64) -> Option<usize> {
+        let dx = cx.wrapping_add(DENSE_TILES / 2) as u64;
+        let dy = cy.wrapping_add(DENSE_TILES / 2) as u64;
+        if dx < DENSE_TILES as u64 && dy < DENSE_TILES as u64 {
+            Some((dy * DENSE_TILES as u64 + dx) as usize)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn set_dense(&mut self, cx: i64, cy: i64, slot: u32) {
+        if let Some(d) = Self::dense_index(cx, cy) {
+            self.dense[d] = slot;
         }
     }
 
@@ -437,6 +464,7 @@ impl TileTable {
             fresh.occ_mask[idx / 64] |= 1u64 << (idx % 64);
             fresh.states[idx] = SlotState::Occupied;
             fresh.keys[idx] = (cx, cy);
+            fresh.set_dense(cx, cy, idx as u32);
             fresh.tiles[idx] = std::mem::replace(&mut self.tiles[i], Tile::new());
         }
         *self = fresh;
@@ -445,6 +473,11 @@ impl TileTable {
     /// Get a tile, if it exists.
     #[inline]
     pub fn get_tile(&self, cx: i64, cy: i64) -> Option<&Tile> {
+        if let Some(d) = Self::dense_index(cx, cy) {
+            let slot = unsafe { *self.dense.get_unchecked(d) };
+            return (slot != DENSE_NONE)
+                .then(|| unsafe { self.tiles.get_unchecked(slot as usize) });
+        }
         let mut idx = self.hash(cx, cy);
         for _ in 0..self.states.len() {
             // Unsafe: idx is masked by self.mask
@@ -465,6 +498,11 @@ impl TileTable {
     /// Get a mutable tile, if it exists.
     #[inline]
     pub fn get_tile_mut(&mut self, cx: i64, cy: i64) -> Option<&mut Tile> {
+        if let Some(d) = Self::dense_index(cx, cy) {
+            let slot = unsafe { *self.dense.get_unchecked(d) };
+            return (slot != DENSE_NONE)
+                .then(|| unsafe { self.tiles.get_unchecked_mut(slot as usize) });
+        }
         let mut idx = self.hash(cx, cy);
         for _ in 0..self.states.len() {
             // Unsafe: idx is masked by self.mask
@@ -487,6 +525,12 @@ impl TileTable {
     /// further along the chain.
     #[inline]
     pub fn get_or_create(&mut self, cx: i64, cy: i64) -> &mut Tile {
+        if let Some(d) = Self::dense_index(cx, cy) {
+            let slot = self.dense[d];
+            if slot != DENSE_NONE {
+                return unsafe { self.tiles.get_unchecked_mut(slot as usize) };
+            }
+        }
         let mut idx = self.hash(cx, cy);
         let mut first_tombstone: Option<usize> = None;
         let mut found: Option<usize> = None;
@@ -539,6 +583,7 @@ impl TileTable {
         self.occ_mask[slot / 64] |= 1u64 << (slot % 64);
         self.states[slot] = SlotState::Occupied;
         self.keys[slot] = (cx, cy);
+        self.set_dense(cx, cy, slot as u32);
         self.tiles[slot] = Tile::new();
         &mut self.tiles[slot]
     }
@@ -555,6 +600,7 @@ impl TileTable {
         self.occ_mask[idx / 64] |= 1u64 << (idx % 64);
         self.states[idx] = SlotState::Occupied;
         self.keys[idx] = (cx, cy);
+        self.set_dense(cx, cy, idx as u32);
         self.tiles[idx] = Tile::new();
         &mut self.tiles[idx]
     }
@@ -572,7 +618,9 @@ impl TileTable {
                 SlotState::Occupied => {
                     if unsafe { *self.keys.get_unchecked(idx) } == (cx, cy) {
                         self.states[idx] = SlotState::Tombstone;
-                        self.tiles[idx].clear();
+                        self.set_dense(cx, cy, DENSE_NONE);
+                        // No clear() here: a non-Occupied slot is unreachable, and
+                        // get_or_create/insert_fresh zero the tile on reuse anyway.
                         self.count -= 1;
                         self.occ_mask[idx / 64] &= !(1u64 << (idx % 64));
                         // A tombstone run ending at an Empty can be freed: any probe crossing
@@ -606,6 +654,30 @@ impl TileTable {
     /// Index 4 is the center tile.
     #[inline]
     pub fn get_neighborhood(&self, cx: i64, cy: i64) -> [Option<&Tile>; 9] {
+        // Away from the block's edge all nine tiles are fixed offsets from the centre's
+        // index: one bounds check instead of nine lookups.
+        let dx = cx.wrapping_add(DENSE_TILES / 2) as u64;
+        let dy = cy.wrapping_add(DENSE_TILES / 2) as u64;
+        if dx.wrapping_sub(1) < (DENSE_TILES - 2) as u64 && dy.wrapping_sub(1) < (DENSE_TILES - 2) as u64
+        {
+            let c = (dy * DENSE_TILES as u64 + dx) as usize;
+            let w = DENSE_TILES as usize;
+            let at = |d: usize| {
+                let slot = unsafe { *self.dense.get_unchecked(d) };
+                (slot != DENSE_NONE).then(|| unsafe { self.tiles.get_unchecked(slot as usize) })
+            };
+            return [
+                at(c - w - 1),
+                at(c - w),
+                at(c - w + 1),
+                at(c - 1),
+                at(c),
+                at(c + 1),
+                at(c + w - 1),
+                at(c + w),
+                at(c + w + 1),
+            ];
+        }
         [
             self.get_tile(cx - 1, cy - 1), // 0: (-1, -1)
             self.get_tile(cx, cy - 1),     // 1: (0, -1)
@@ -628,6 +700,7 @@ impl TileTable {
         self.count = 0;
         self.used = 0;
         self.occ_mask.fill(0);
+        self.dense.fill(DENSE_NONE);
     }
 
     /// Get the number of occupied tiles.
@@ -771,9 +844,22 @@ impl TileTable {
         &self,
         is_white: bool,
     ) -> impl Iterator<Item = (i64, i64, Piece)> + '_ {
+        self.iter_colors(if is_white { !0 } else { 0 }, if is_white { 0 } else { !0 })
+    }
+
+    /// White and black pieces, skipping voids and obstacles, in slot order: the same
+    /// order on every platform, unlike iterating a hash set of squares.
+    #[inline]
+    pub fn iter_colored_pieces(&self) -> impl Iterator<Item = (i64, i64, Piece)> + '_ {
+        self.iter_colors(!0, !0)
+    }
+
+    #[inline]
+    fn iter_colors(&self, white: u64, black: u64) -> TileTableColorIter<'_> {
         TileTableColorIter {
             table: self,
-            is_white,
+            white,
+            black,
             bucket_mask_idx: 0,
             bucket_mask: self.occ_mask[0],
             current_bucket_idx: None,
@@ -841,7 +927,9 @@ impl<'a> Iterator for TileTablePieceIter<'a> {
 /// Iterator over pieces of a specific color
 struct TileTableColorIter<'a> {
     table: &'a TileTable,
-    is_white: bool,
+    /// All-ones to include that colour's occupancy, zero to skip it.
+    white: u64,
+    black: u64,
     bucket_mask_idx: usize,
     bucket_mask: u64,
     current_bucket_idx: Option<usize>,
@@ -891,11 +979,8 @@ impl<'a> Iterator for TileTableColorIter<'a> {
                 self.current_bucket_idx = Some(bucket_idx);
                 // Use color-specific occupancy
                 let tile = &self.table.tiles[bucket_idx];
-                self.current_tile_bits = if self.is_white {
-                    tile.occ_white
-                } else {
-                    tile.occ_black
-                };
+                self.current_tile_bits =
+                    (tile.occ_white & self.white) | (tile.occ_black & self.black);
             }
         }
     }

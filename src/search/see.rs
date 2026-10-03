@@ -86,64 +86,6 @@ pub(crate) fn static_exchange_eval_impl(game: &GameState, m: &Move) -> i32 {
         None => (0, game.get_piece_value(m.piece.piece_type(), mover_color)),
     };
 
-    /// Helper function to determine if a piece can attack the target legally.
-    /// Accounts for pinned pieces.
-    #[inline(always)]
-    fn can_piece_legally_attack(
-        game: &GameState,
-        pos: &Coordinate,
-        target: &Coordinate,
-        color: PlayerColor,
-    ) -> bool {
-        // If the opponent's win condition does not require check evasion, then the piece can attack freely.
-        let opponent_win_condition = if color == PlayerColor::White {
-            game.game_rules.black_win_condition
-        } else {
-            game.game_rules.white_win_condition
-        };
-        if !opponent_win_condition.requires_check_evasion() {
-            return true;
-        }
-
-        // Is there a king of the same color on the board?
-        let king_pos = if color == PlayerColor::White {
-            game.white_royals.first().copied()
-        } else {
-            game.black_royals.first().copied()
-        };
-        let Some(king) = king_pos else {
-            // No king - can't be pinned
-            return true;
-        };
-
-        // Is piece on a slider ray from king?
-        let dx = pos.x - king.x;
-        let dy = pos.y - king.y;
-
-        let on_slider_ray = dx == 0  // Vertical (same file)
-            || dy == 0               // Horizontal (same rank)  
-            || dx.abs() == dy.abs(); // Diagonal
-
-        if !on_slider_ray {
-            // Cannot be pinned
-            return true;
-        }
-
-        // If it's not pinned, it can attack, otherwise, check if the attack
-        // direction is on the same line with the pinned direction.
-        let pin_direction = if color == PlayerColor::White {
-            game.pinned_white.get(&(pos.x, pos.y))
-        } else {
-            game.pinned_black.get(&(pos.x, pos.y))
-        };
-
-        if let Some(&(pdx, pdy)) = pin_direction {
-            (target.x - pos.x) * pdy == (target.y - pos.y) * pdx
-        } else {
-            true
-        }
-    }
-
     /// Represents an attacker looking on the target square.
     #[derive(Clone, Copy, Debug)]
     struct Attacker {
@@ -269,16 +211,86 @@ pub(crate) fn static_exchange_eval_impl(game: &GameState, m: &Move) -> i32 {
         }
     }
 
+    // Huygens attack from prime distances off the 3x3 tile scan, so without this they
+    // neither attack nor defend in an exchange. (Roses measured too slow to add here.)
+    let idx = &game.spatial_indices;
+    if idx.has_huygen.iter().any(|&h| h) {
+        const BITS: u32 = 1u32 << (PieceType::Huygen as u8);
+        let target = Coordinate::new(target_x, target_y);
+        for (cx, cy, tile) in game.board.tiles.iter() {
+            if (tile.type_mask_white | tile.type_mask_black) & BITS == 0 {
+                continue;
+            }
+            let mut bits = tile.occ_white | tile.occ_black;
+            while bits != 0 {
+                let i = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let p = Piece::from_packed(tile.piece[i]);
+                if p.piece_type() != PieceType::Huygen {
+                    continue;
+                }
+                let pos = Coordinate::new(cx * 8 + (i % 8) as i64, cy * 8 + (i / 8) as i64);
+                if pos != m.from
+                    && crate::moves::is_piece_attacking_square(
+                        &game.board,
+                        &p,
+                        &pos,
+                        &target,
+                        idx,
+                        &game.game_rules,
+                    )
+                {
+                    attackers.push(Attacker {
+                        value: game.get_piece_value(p.piece_type(), p.color()),
+                        color: p.color(),
+                        pos,
+                        ray_idx: None,
+                        is_royal: false,
+                    });
+                }
+            }
+        }
+    }
+
     // B. Lazy Ray Discovery (Sliding Pieces + Distant Knights/Kings)
-    // We only find the FIRST blocker on each ray.
+    // We only find the FIRST blocker on each ray. One scan per line yields both of
+    // its rays, in the same order as ray_dirs 0..8.
+    let mut slider_first: [Option<(i64, i64, Piece)>; 8] = [None; 8];
+    {
+        let idx = &game.spatial_indices;
+        let (k1, k2) = (target_x - target_y, target_x + target_y);
+        let at = |e: crate::moves::LineEnd, to_xy: &dyn Fn(i64) -> (i64, i64)| {
+            e.map(|(c, packed)| {
+                let (x, y) = to_xy(c);
+                (x, y, Piece::from_packed(packed))
+            })
+        };
+        if let Some(l) = idx.rows.get(&target_y) {
+            let (f, b) = l.neighbors(target_x);
+            slider_first[0] = at(f, &|c| (c, target_y));
+            slider_first[1] = at(b, &|c| (c, target_y));
+        }
+        if let Some(l) = idx.cols.get(&target_x) {
+            let (f, b) = l.neighbors(target_y);
+            slider_first[2] = at(f, &|c| (target_x, c));
+            slider_first[3] = at(b, &|c| (target_x, c));
+        }
+        if let Some(l) = idx.diag1.get(&k1) {
+            let (f, b) = l.neighbors(target_x);
+            slider_first[4] = at(f, &|c| (c, c - k1));
+            slider_first[7] = at(b, &|c| (c, c - k1));
+        }
+        if let Some(l) = idx.diag2.get(&k2) {
+            let (f, b) = l.neighbors(target_x);
+            slider_first[5] = at(f, &|c| (c, k2 - c));
+            slider_first[6] = at(b, &|c| (c, k2 - c));
+        }
+    }
     for (r, &(dx, dy)) in ray_dirs.iter().enumerate() {
         let mut found_pos: Option<(i64, i64, Piece)> = None;
 
         if r < 8 {
-            // Cardinal/Diagonal via SpatialIndices (Infinite range)
-            found_pos = game
-                .spatial_indices
-                .find_first_blocker(target_x, target_y, dx, dy);
+            found_pos = slider_first[r];
         } else if game.spatial_indices.has_knightrider[0] || game.spatial_indices.has_knightrider[1]
         {
             // Knightrider Rays. Capped at the same hop count `is_square_attacked`
@@ -331,6 +343,12 @@ pub(crate) fn static_exchange_eval_impl(game: &GameState, m: &Move) -> i32 {
             };
 
             let pos = Coordinate::new(vx, vy);
+            // Already in the exchange from the leaper/pawn scan: give it this ray, so the
+            // slider behind it joins once it has recaptured.
+            if let Some(a) = attackers.iter_mut().find(|a| a.pos == pos && a.ray_idx.is_none()) {
+                a.ray_idx = Some(r);
+                continue;
+            }
             let pt = p.piece_type();
             let dist = (vx - target_x).abs().max((vy - target_y).abs());
 
@@ -369,45 +387,24 @@ pub(crate) fn static_exchange_eval_impl(game: &GameState, m: &Move) -> i32 {
 
         for i in 0..attackers.len() {
             let a = &attackers[i];
-            if a.color == side && a.value < best_val {
-                best_val = a.value;
+            // A royal goes last whatever its value: a Checkmate king is worth less than a knight.
+            let key = if a.is_royal { i32::MAX - 1 } else { a.value };
+            if a.color == side && key < best_val {
+                best_val = key;
                 best_i = Some(i);
             }
         }
 
-        if let Some(mut i) = best_i {
-            // A royal cannot recapture into a defended square. Being the most valuable,
-            // it is only ever picked last, so any remaining enemy attacker ends the
-            // exchange here.
+        if let Some(i) = best_i {
+            // A royal cannot recapture into a defended square, so any remaining enemy
+            // attacker ends the exchange here.
             if attackers[i].is_royal && attackers.iter().any(|a| a.color == side.opponent()) {
                 break;
             }
 
-            // If the piece is pinned, do a full rescan of the best attacker that is not pinned
-            if !can_piece_legally_attack(game, &attackers[i].pos, &m.to, attackers[i].color) {
-                let mut found_nothing = true;
-                best_val = i32::MAX;
-
-                for j in 0..attackers.len() {
-                    let a = &attackers[j];
-                    if a.color == side
-                        && a.value < best_val
-                        && can_piece_legally_attack(game, &a.pos, &m.to, a.color)
-                    {
-                        found_nothing = false;
-                        best_val = a.value;
-                        i = j;
-                    }
-                }
-
-                if found_nothing {
-                    break;
-                }
-            }
-
             let chosen = attackers.swap_remove(i);
             gain[depth] = occ_val - gain[depth - 1];
-            occ_val = best_val;
+            occ_val = chosen.value;
 
             // X-Ray Discovery!
             if let Some(r) = chosen.ray_idx {
@@ -663,6 +660,7 @@ mod tests {
         game.en_passant = Some(EnPassantState {
             square: Coordinate::new(4, 6),
             pawn_square: Coordinate::new(4, 5),
+            hashed: true,
         });
         let m = Move::new(
             Coordinate::new(5, 5),
@@ -708,9 +706,10 @@ mod tests {
     }
 
     #[test]
-    fn test_see_pinned_piece_cannot_recapture() {
-        // The white rook eyeing the black bishop is pinned to its king, so it cannot
-        // recapture. Without pin detection SEE plays that illegal rook capture.
+    fn test_see_ignores_pins() {
+        // SEE is deliberately pin-blind: the pin maps it used to consult are built at
+        // setup and never maintained by make/undo, so inside the tree they described
+        // the root position. The white rook here is pinned and SEE still counts it.
         let mut game = create_test_game_from_icn("w (8;q|1;q) K1,1|R3,3|B1,5|b3,7|q3,8|k1,10|b6,6");
         game.turn = PlayerColor::White;
 
@@ -720,17 +719,16 @@ mod tests {
             Piece::new(PieceType::Bishop, PlayerColor::White),
         );
 
-        assert_eq!(
+        assert_ne!(
             static_exchange_eval_impl(&game, &m),
             0,
-            "The white rook is pinned to the white king; the black queen should take the bishop."
+            "pins are ignored, so the pinned white rook still defends the bishop"
         );
     }
 
     #[test]
     fn test_see_piece_is_not_pinned_in_all_pieces_captured() {
-        // Same condition as the test above but this time, the rook is not pinned
-        // since the king can be captured in AllRoyalsCaptured win condition.
+        // The rook is not pinned under AllRoyalsCaptured, where the king is capturable.
         let mut game = create_test_game_from_icn(
             "w (8;q|1;q) allroyalscaptured K1,1|R3,3|B1,5|b3,7|q3,8|k1,10|b6,6",
         );
@@ -751,8 +749,8 @@ mod tests {
 
     #[test]
     fn test_see_pinned_piece_can_recapture_on_same_line() {
-        // The same shape, but the pin runs along the capture direction, so the pinned
-        // white bishop may still recapture and the exchange is sound.
+        // The pin runs along the capture direction, so the white bishop may recapture
+        // and the exchange is sound whether or not pins are modelled.
         let mut game = create_test_game_from_icn("w 1 (8;q|1;q) K0,4|R3,3|B1,5|b3,7|q3,8|k1,10");
         game.turn = PlayerColor::White;
 

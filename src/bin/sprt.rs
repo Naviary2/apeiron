@@ -116,9 +116,18 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         max_moves: usize,
 
-        /// Search noise amplitude for first 8 ply
+        /// Eval noise amplitude used to vary the opening book
         #[arg(long, default_value_t = 50)]
         search_noise: i32,
+
+        /// Plies of each pair's shared opening: played in the pair's first game, off the
+        /// clock, then replayed in the second (0 = engines open with noise)
+        #[arg(long, default_value_t = 8)]
+        book_plies: usize,
+
+        /// Fixed search depth of each book move
+        #[arg(long, default_value_t = 7)]
+        book_depth: usize,
 
         /// Old engine strength level (1-8; 8 = full strength, the default)
         #[arg(long, default_value_t = 8)]
@@ -230,10 +239,16 @@ fn exited_by_console_interrupt(status: &std::process::ExitStatus) -> bool {
 /// A persistent engine process for one game. Reusing it across every move is what
 /// real play does: the TT, history and correction tables stay warm, and the ~50ms
 /// Windows process spawn is paid once per game instead of once per move.
+/// Slack past a move's time budget before a silent engine counts as hung.
+const HANG_GRACE_MS: u64 = 5_000;
+const BOOK_HANG_BUDGET_MS: u64 = 30_000;
+
 struct ServeEngine {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
-    stdout: std::io::BufReader<std::process::ChildStdout>,
+    /// Lines from a reader thread, so a silent engine can be timed out instead of
+    /// blocking the game (and its whole shard) forever.
+    lines: std::sync::mpsc::Receiver<String>,
 }
 
 impl ServeEngine {
@@ -252,11 +267,26 @@ impl ServeEngine {
             })
             .spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+        let mut stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            loop {
+                let mut line = String::new();
+                match stdout.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         Ok(ServeEngine {
             child,
             stdin,
-            stdout,
+            lines,
         })
     }
 
@@ -278,20 +308,31 @@ impl ServeEngine {
         }
     }
 
-    fn request(&mut self, req: &ServeRequest) -> std::io::Result<ServeResponse> {
-        use std::io::{BufRead, Write};
+    /// Past `deadline` the engine is killed and the request fails with `TimedOut`.
+    fn request(&mut self, req: &ServeRequest, deadline: Duration) -> std::io::Result<ServeResponse> {
+        use std::io::Write;
+        use std::sync::mpsc::RecvTimeoutError;
         let encoded = serde_json::to_string(req)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         writeln!(self.stdin, "{encoded}")?;
         self.stdin.flush()?;
 
-        let mut line = String::new();
-        if self.stdout.read_line(&mut line)? == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "engine closed its output (crashed or exited)",
-            ));
-        }
+        let line = match self.lines.recv_timeout(deadline) {
+            Ok(line) => line,
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = self.child.kill();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("engine gave no answer within {} ms", deadline.as_millis()),
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "engine closed its output (crashed or exited)",
+                ));
+            }
+        };
         serde_json::from_str(line.trim())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
@@ -495,6 +536,8 @@ struct Config {
     use_serve: bool,
     max_moves: usize,
     search_noise: i32,
+    book_plies: usize,
+    book_depth: usize,
     new_strength: u32,
     old_strength: u32,
     verbose: bool,
@@ -523,6 +566,8 @@ struct GameOutcome {
     game_idx: usize,
     termination_reason: String,
     new_engine_timed_out: bool,
+    /// The first `book_plies` moves, replayed as the pair's second game's book.
+    opening: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -947,6 +992,8 @@ struct ResumeState {
     draws: usize,
     penta: PentaCounts,
     per_variant_stats: HashMap<String, (usize, usize, usize)>,
+    timeout_losses: usize,
+    new_engine_timeouts: usize,
     resume_pair_offset: usize,
     detected_tc: Option<String>,
     detected_variants: Vec<String>,
@@ -962,6 +1009,8 @@ fn load_resume_state(path: &str) -> ResumeState {
     let mut losses = 0usize;
     let mut draws = 0usize;
     let mut per_variant_stats: HashMap<String, (usize, usize, usize)> = HashMap::new();
+    let mut timeout_losses = 0usize;
+    let mut new_engine_timeouts = 0usize;
     let mut max_game_idx: Option<usize> = None;
     let mut detected_tc: Option<String> = None;
     let mut seen_variants: HashSet<String> = HashSet::new();
@@ -980,6 +1029,7 @@ fn load_resume_state(path: &str) -> ResumeState {
         }
 
         let result_tag = parse_icn_tag(icn, "Result");
+        let termination_reason = parse_icn_tag(icn, "Termination");
         let white_player = parse_icn_tag(icn, "White");
         let new_plays_white = white_player.as_deref() == Some("Apeiron New");
 
@@ -1000,6 +1050,13 @@ fn load_resume_state(path: &str) -> ResumeState {
             }
             _ => GameResult::Draw,
         };
+
+        if termination_reason.as_deref() == Some("Loss on time") {
+            timeout_losses += 1;
+            if result == GameResult::Loss {
+                new_engine_timeouts += 1;
+            }
+        }
 
         match result {
             GameResult::Win => wins += 1,
@@ -1050,6 +1107,8 @@ fn load_resume_state(path: &str) -> ResumeState {
         draws,
         penta,
         per_variant_stats,
+        timeout_losses,
+        new_engine_timeouts,
         resume_pair_offset,
         detected_tc,
         detected_variants,
@@ -1100,7 +1159,9 @@ fn parse_bestmove_to_icn(bestmove_str: &str, turn: PlayerColor) -> Option<String
 }
 
 fn has_any_fully_legal_move(game: &GameState) -> bool {
-    let moves = game.get_pseudo_legal_moves();
+    // A move missing from the cached list is adjudicated as mate or stalemate.
+    let mut moves = apeiron::moves::MoveList::new();
+    game.get_pseudo_legal_moves_into(&mut moves);
     for m in moves {
         let mut game_copy = game.clone();
         game_copy.make_move(&m);
@@ -1337,6 +1398,7 @@ fn play_game(
     new_plays_white: bool,
     game_idx: usize,
     seeds: Vec<u64>,
+    book: &[String],
 ) -> GameOutcome {
     let mut game = with_variant_bounds(variant, || {
         let mut game = GameState::new();
@@ -1377,14 +1439,14 @@ fn play_game(
     // this function returns by any path.
     let mut new_engine: Option<ServeEngine> = None;
     let mut old_engine: Option<ServeEngine> = None;
+    // Book plies searched here run in throwaway processes, killed when the book ends,
+    // so both games of a pair hand their engines the book position with nothing warm.
+    let mut book_new: Option<ServeEngine> = None;
+    let mut book_old: Option<ServeEngine> = None;
     let termination_reason;
 
-    let get_eval = |g: &GameState| {
-        #[cfg(feature = "nnue")]
-        return with_variant_bounds(variant, || apeiron::evaluation::evaluate(g, None));
-        #[cfg(not(feature = "nnue"))]
-        return with_variant_bounds(variant, || apeiron::evaluation::evaluate(g));
-    };
+    let get_eval =
+        |g: &GameState| with_variant_bounds(variant, || apeiron::evaluation::evaluate(g));
 
     /// Helper to create an outcome return value
     macro_rules! game_outcome {
@@ -1405,6 +1467,7 @@ fn play_game(
                 game_idx,
                 termination_reason: $reason.to_string(),
                 new_engine_timed_out: false,
+                opening: move_history_clean.iter().take(config.book_plies).cloned().collect(),
             }
         };
     }
@@ -1416,6 +1479,7 @@ fn play_game(
         game_idx,
         termination_reason: "interrupted".to_string(),
         new_engine_timed_out: false,
+        opening: Vec::new(),
     };
 
     // Record initial position
@@ -1424,7 +1488,21 @@ fn play_game(
         *repetition_counts.entry(key).or_insert(0) += 1;
     }
 
-    for (ply, &seed_val) in seeds.iter().enumerate().take(config.max_moves) {
+    // The pair's shared opening: played before either engine moves, off the clock.
+    for mv in book {
+        move_info_log.push(format!("{}{{[%clk {}] [%book]}}", mv, format_clock(config.tc_base_ms)));
+        move_history_clean.push(mv.clone());
+        let icn = format!("{} {}", starting_board_setup, move_history_clean.join("|"));
+        game = with_variant_bounds(variant, || {
+            let mut game = GameState::new();
+            game.setup_position_from_icn(&icn);
+            game.variant = Some(variant);
+            game
+        });
+        *repetition_counts.entry(make_position_key(&game)).or_insert(0) += 1;
+    }
+
+    for (ply, &seed_val) in seeds.iter().enumerate().take(config.max_moves).skip(book.len()) {
         if STOP.load(Ordering::SeqCst) {
             if USER_STOP.load(Ordering::SeqCst) {
                 return interrupted();
@@ -1555,6 +1633,11 @@ fn play_game(
 
         // Engine search
         let is_new_turn = (game.turn == PlayerColor::White) == new_plays_white;
+        let in_book = ply < config.book_plies;
+        if !in_book {
+            book_new = None;
+            book_old = None;
+        }
 
         let bin = if is_new_turn {
             &config.new_bin
@@ -1574,13 +1657,15 @@ fn play_game(
             config.old_strength
         };
 
+        let mut hung = false;
         let (bestmove_raw, score, panic_detail, crash_detail, elapsed) = if config.use_serve {
             // One process for the whole game: the engine keeps its TT, history and
             // correction tables warm across moves, as it does in real play.
-            let slot = if is_new_turn {
-                &mut new_engine
-            } else {
-                &mut old_engine
+            let slot = match (in_book, is_new_turn) {
+                (true, true) => &mut book_new,
+                (true, false) => &mut book_old,
+                (false, true) => &mut new_engine,
+                (false, false) => &mut old_engine,
             };
             if slot.is_none() {
                 match ServeEngine::spawn(bin, config.verbose) {
@@ -1608,20 +1693,42 @@ fn play_game(
                 btime: black_clock,
                 winc: config.tc_inc_ms,
                 binc: config.tc_inc_ms,
-                fixed_time: config.tc_fixed_ms,
-                max_depth: config.tc_max_depth,
-                noise_amp: (ply < 8).then_some(config.search_noise),
+                fixed_time: if in_book { Some(600_000) } else { config.tc_fixed_ms },
+                max_depth: if in_book { Some(config.book_depth) } else { config.tc_max_depth },
+                noise_amp: (in_book || (config.book_plies == 0 && ply < 8))
+                    .then_some(config.search_noise),
                 seed: Some(seed_val),
                 strength: (strength < apeiron::search::MAX_SITE_SKILL).then_some(strength),
             };
 
             let round_trip = Instant::now();
+            // The clock (or fixed budget) plus grace: an engine still silent after that
+            // is hung, and waiting longer only stalls the shard.
+            let own_clock = if game.turn == PlayerColor::White { white_clock } else { black_clock };
+            // Book moves carry a nominal 600 s budget but are depth-capped to milliseconds.
+            let budget = if in_book {
+                BOOK_HANG_BUDGET_MS
+            } else {
+                req.fixed_time.map_or(own_clock + config.tc_inc_ms, u64::from)
+            };
+            let deadline = Duration::from_millis(budget + HANG_GRACE_MS);
             // Bound the borrow before `died_by_interrupt` needs `engine` again.
-            let response = engine.request(&req);
+            let response = engine.request(&req, deadline);
             match response {
                 // Charge everything the engine itself did (parse, replay, search),
                 // not the one-time process spawn that already happened before this.
                 Ok(resp) => (resp.bestmove, resp.score, resp.panic, None, resp.elapsed_ms),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    eprintln!(
+                        "ALERT: game {game_idx} [{}] {} engine hung ({e}); scored as a loss on time. Position: {}",
+                        variant.to_str(),
+                        if is_new_turn { "NEW" } else { "OLD" },
+                        subprocess_icn
+                    );
+                    hung = true;
+                    *slot = None;
+                    (None, None, None, None, deadline.as_millis() as u64)
+                }
                 Err(e) => {
                     // Ctrl+C kills the engine child before this process's handler
                     // thread sets USER_STOP, so the closed pipe used to be read as
@@ -1658,14 +1765,19 @@ fn play_game(
                 .arg("--variant")
                 .arg(variant.to_str());
 
-            if let Some(d) = config.tc_max_depth {
+            let (max_depth, fixed_ms) = if in_book {
+                (Some(config.book_depth), Some(600_000))
+            } else {
+                (config.tc_max_depth, config.tc_fixed_ms)
+            };
+            if let Some(d) = max_depth {
                 cmd.arg("--max-depth").arg(d.to_string());
             }
-            if let Some(ft) = config.tc_fixed_ms {
+            if let Some(ft) = fixed_ms {
                 cmd.arg("--fixed-time").arg(ft.to_string());
             }
 
-            if ply < 8 {
+            if in_book || (config.book_plies == 0 && ply < 8) {
                 cmd.arg("--noise-amp").arg(config.search_noise.to_string());
             }
 
@@ -1764,12 +1876,12 @@ fn play_game(
         } else {
             black_clock
         };
-        let (flagged_on_time, remaining_clock) = account_move_time(
-            current_clock,
-            elapsed,
-            config.tc_inc_ms,
-            config.tc_fixed_ms.is_some(),
-        );
+        let (flagged_on_time, remaining_clock) = if in_book {
+            (false, current_clock)
+        } else {
+            account_move_time(current_clock, elapsed, config.tc_inc_ms, config.tc_fixed_ms.is_some())
+        };
+        let flagged_on_time = flagged_on_time || hung;
 
         if flagged_on_time {
             let result = if is_new_turn {
@@ -1795,13 +1907,16 @@ fn play_game(
                 game_idx,
                 termination_reason: "timeout".to_string(),
                 new_engine_timed_out: is_new_turn,
+                opening: move_history_clean.iter().take(config.book_plies).cloned().collect(),
             };
         }
 
         if let Some(move_icn) = bestmove_icn {
             // Build annotated move for the output log
             let mut comment = format!("[%clk {}]", format_clock(remaining_clock));
-            if let Some(mut s) = score {
+            if in_book {
+                comment.push_str(" [%book]");
+            } else if let Some(mut s) = score {
                 // Flip score to White's perspective if Black just moved
                 if game.turn == PlayerColor::White {
                     s = -s;
@@ -1981,6 +2096,7 @@ fn play_game(
                 game_idx,
                 termination_reason: termination_reason.unwrap_or("engine failure").to_string(),
                 new_engine_timed_out: false,
+                opening: move_history_clean.iter().take(config.book_plies).cloned().collect(),
             };
         }
     }
@@ -3094,6 +3210,8 @@ fn main() {
             results,
             max_moves,
             search_noise,
+            book_plies,
+            book_depth,
             old_strength,
             new_strength,
             verbose,
@@ -3364,6 +3482,8 @@ fn main() {
                 old_bin,
                 max_moves,
                 search_noise,
+                book_plies,
+                book_depth,
                 new_strength: new_strength.clamp(1, apeiron::search::MAX_SITE_SKILL),
                 old_strength: old_strength.clamp(1, apeiron::search::MAX_SITE_SKILL),
                 verbose,
@@ -3481,6 +3601,8 @@ fn main() {
                 stats.losses = rs.losses;
                 stats.draws = rs.draws;
                 stats.penta = rs.penta;
+                stats.timeout_losses = rs.timeout_losses;
+                stats.new_engine_timeouts = rs.new_engine_timeouts;
                 // Resumed variants merge into the pre-seeded map rather than
                 // replacing it, so the fixed row order still covers every variant.
                 for (name, counts) in rs.per_variant_stats {
@@ -3560,49 +3682,22 @@ fn main() {
 
                                     let play_new_white_first = rand::random::<bool>();
                                     let mut pair_outcomes = Vec::with_capacity(2);
-
-                                    if play_new_white_first {
-                                        pair_outcomes.push(play_game(
-                                            &config,
-                                            variant,
-                                            true,
-                                            game_idx_even,
-                                            seeds.clone(),
-                                        ));
-                                        if STOP.load(Ordering::SeqCst) {
-                                            let _ = tx.send(pair_outcomes);
+                                    // The first game plays the opening; the second replays it.
+                                    let mut book: Vec<String> = Vec::new();
+                                    for new_white in [play_new_white_first, !play_new_white_first] {
+                                        let idx = if new_white { game_idx_even } else { game_idx_odd };
+                                        if !new_white && config.max_games.is_some_and(|max| game_idx_odd >= max) {
+                                            continue;
+                                        }
+                                        if !pair_outcomes.is_empty() && STOP.load(Ordering::SeqCst) {
                                             break;
                                         }
-                                        if config.max_games.is_none_or(|max| game_idx_odd < max) {
-                                            pair_outcomes.push(play_game(
-                                                &config,
-                                                variant,
-                                                false,
-                                                game_idx_odd,
-                                                seeds,
-                                            ));
+                                        let outcome =
+                                            play_game(&config, variant, new_white, idx, seeds.clone(), &book);
+                                        if book.is_empty() {
+                                            book = outcome.opening.clone();
                                         }
-                                    } else {
-                                        if config.max_games.is_none_or(|max| game_idx_odd < max) {
-                                            pair_outcomes.push(play_game(
-                                                &config,
-                                                variant,
-                                                false,
-                                                game_idx_odd,
-                                                seeds.clone(),
-                                            ));
-                                        }
-                                        if STOP.load(Ordering::SeqCst) {
-                                            let _ = tx.send(pair_outcomes);
-                                            break;
-                                        }
-                                        pair_outcomes.push(play_game(
-                                            &config,
-                                            variant,
-                                            true,
-                                            game_idx_even,
-                                            seeds,
-                                        ));
+                                        pair_outcomes.push(outcome);
                                     }
 
                                     if tx.send(pair_outcomes).is_err() {

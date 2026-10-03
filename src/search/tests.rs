@@ -146,7 +146,7 @@ fn bench_time_to_depth() {
             GLOBAL_STOP.store(false, std::sync::atomic::Ordering::Relaxed);
             for i in 1..threads {
                 let gc = helper_game.clone();
-                rayon::spawn(move || helper_run(gc, epoch, i));
+                rayon::spawn(move || helper_run(gc, epoch, i, target, 1));
             }
             while reached < target {
                 let start = (reached + 1).min(target);
@@ -220,18 +220,6 @@ fn test_searcher_new() {
     assert_eq!(searcher.thread_id, 0);
     assert_eq!(searcher.killers.len(), MAX_PLY);
     assert_eq!(searcher.pv_length.len(), MAX_PLY);
-}
-
-#[test]
-fn test_searcher_decay_history() {
-    let mut searcher = Searcher::new(5000);
-    searcher.history[0][0][0] = 100;
-    searcher.history[0][1][1] = 200;
-
-    searcher.decay_history();
-
-    assert_eq!(searcher.history[0][0][0], 90); // 100 * 9/10
-    assert_eq!(searcher.history[0][1][1], 180); // 200 * 9/10
 }
 
 #[test]
@@ -333,7 +321,7 @@ fn thread_result(
             to: Coordinate::new(to.0, to.1),
             piece: Piece::new(PieceType::Pawn, PlayerColor::White),
             promotion: promo,
-            partner_coord: None,
+            partner_x: crate::moves::NO_PARTNER,
         },
         score,
         completed_depth: depth,
@@ -446,10 +434,6 @@ fn test_evaluate_with_search() {
     // Balanced position
     game.setup_position_from_icn("w K0,0|k7,7|R4,2|r4,7");
 
-    // Get static eval
-    #[cfg(feature = "nnue")]
-    let static_eval = evaluate(&game, None);
-    #[cfg(not(feature = "nnue"))]
     let static_eval = evaluate(&game);
     // Should be close to 0 (roughly balanced)
     assert!(
@@ -676,9 +660,9 @@ fn test_countermove_heuristic() {
     // Update countermove table
     let prev_from_hash = 10;
     let prev_to_hash = 20;
-    searcher.countermoves[prev_from_hash][prev_to_hash] = (1, 5, 5);
+    searcher.countermoves[0][prev_from_hash][prev_to_hash] = (1, 5, 5);
 
-    let (piece_type, to_x, to_y) = searcher.countermoves[prev_from_hash][prev_to_hash];
+    let (piece_type, to_x, to_y) = searcher.countermoves[0][prev_from_hash][prev_to_hash];
     assert_eq!(piece_type, 1);
     assert_eq!(to_x, 5);
     assert_eq!(to_y, 5);
@@ -688,8 +672,8 @@ fn test_countermove_heuristic() {
 fn test_countermove_beyond_i16_range() {
     // Coordinates outside i16 (-32768..32767) must not alias to a wrong destination.
     let mut searcher = Box::new(Searcher::new(1000));
-    searcher.countermoves[10][20] = (1, 40_000, -40_000);
-    let (piece_type, to_x, to_y) = searcher.countermoves[10][20];
+    searcher.countermoves[0][10][20] = (1, 40_000, -40_000);
+    let (piece_type, to_x, to_y) = searcher.countermoves[0][10][20];
     assert_eq!(piece_type, 1);
     assert_eq!(to_x, 40_000);
     assert_eq!(to_y, -40_000);
@@ -890,4 +874,31 @@ fn test_searcher_silent_mode() {
 fn test_move_rule_limit() {
     let searcher = Box::new(Searcher::new(1000));
     assert_eq!(searcher.move_rule_limit, 100); // Default 50-move rule
+}
+
+#[test]
+fn test_new_search_ages_capture_history() {
+    // The node oracle builds a fresh Searcher per position, so it cannot see any
+    // between-search decay; assert the aging directly instead.
+    let mut searcher = Searcher::new(5000);
+    searcher.capture_history[3][7] = 1024;
+    searcher.new_search();
+    assert_eq!(searcher.capture_history[3][7], 729);
+}
+
+/// A Palace middlegame (two queens and an amazon a side, all in contact) whose depth-1
+/// qsearch alone took ~470k nodes: depth 1 had to finish, so the engine lost on time.
+/// The hard limit must still stop it, and a move must still come back.
+#[test]
+fn depth_one_blowup_still_respects_the_hard_limit() {
+    let icn = "w 0/100 1 (4;n,b,r,q,am|2;n,b,r,q,am) -1000000000000000,1000000000000000,-1000000000000000,1000000000000000 p-3,8+|r-2,8|r-1,8|b0,8|b1,8|p2,8+|p5,8+|b6,8|b7,8|r8,8|r9,8|p10,8+|p-2,7+|p-1,7+|p0,7+|p1,7+|p6,7+|p7,7+|p8,7+|p9,7+|n1,5|q2,5|am3,5|k4,5|q5,5|n6,5|p1,4+|p2,4+|p3,4+|p4,4+|p5,4+|p6,4+|P1,2+|P2,2+|P3,2+|P4,2+|P5,2+|P6,2+|N1,1|Q2,1|AM3,1|K4,1|Q5,1|N6,1|P-2,-1+|P-1,-1+|P0,-1+|P1,-1+|P6,-1+|P7,-1+|P8,-1+|P9,-1+|P-3,-2+|R-2,-2|R-1,-2|B0,-2|B1,-2|P2,-2+|P5,-2+|B6,-2|B7,-2|R8,-2|R9,-2|P10,-2+ 4,1>5,0|4,5>5,6|7,-1>7,0|2,8>2,6|0,-1>0,0|7,7>7,5|6,2>6,3|8,7>8,5|6,3>5,4=Q|1,8>5,4|6,-1>6,0|3,4>3,3|5,0>6,-1|3,3>2,2=am|3,1>2,2|6,8>4,6|1,-2>4,1|7,5>7,4|-2,-1>-2,1|8,5>8,4|4,2>4,3|5,4>3,6|9,-1>9,1|8,4>8,3|1,1>2,3|1,4>2,3|1,2>2,3|5,6>5,7|8,-1>8,1|7,4>7,3";
+    let mut game = GameState::new();
+    game.setup_position_from_icn(icn);
+    game.recompute_piece_counts();
+    game.recompute_hash();
+    crate::search::reset_search_state();
+    let start = std::time::Instant::now();
+    let result = crate::search::get_best_move_parallel(&mut game, 64, 300, 300, true, false);
+    assert!(result.is_some(), "a stopped depth-1 search must still return a move");
+    assert!(start.elapsed().as_millis() < 2500, "took {} ms", start.elapsed().as_millis());
 }

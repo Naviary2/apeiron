@@ -31,7 +31,8 @@ Everything else hangs off that:
 - `src/board.rs` and `src/tiles/` store pieces;
 - `src/moves.rs` and `src/attacks.rs` handle movement geometry and attack queries;
 - `src/search.rs` and `src/search/` decide what to search;
-- `src/evaluation/` scores positions.
+- `src/evaluation/` scores positions;
+- `src/eval_net/` corrects that score with a small learned residual.
 
 If you are trying to understand the project quickly, start with `src/lib.rs`, then `src/game.rs`, then the board/move layers.
 
@@ -100,7 +101,7 @@ This directory holds the search-side policy and machinery:
 - `see.rs` — static exchange evaluation;
 - `tt.rs`, `shared_tt.rs`, `tt_defs.rs` — transposition-table machinery;
 - `zobrist.rs` — hashing keys and helpers;
-- `params.rs` — tunable search constants.
+- `params.rs` — the search parameter table (defaults and tuning ranges).
 
 This split matters. The general move/rule layer lives in `src/moves.rs`; search-specific ordering and heuristics live here.
 
@@ -108,9 +109,19 @@ This split matters. The general move/rule layer lives in `src/moves.rs`; search-
 
 This is the static evaluation layer.
 
-`base.rs` contains the default hand-crafted evaluation. `helpers.rs`, `mop_up.rs`, and `insufficient_material.rs` support it. `variants/` exists for cases where a variant needs genuinely different scoring rather than a tiny rules tweak.
+`base.rs` contains the default hand-crafted evaluation; its tunable weights live in the `params.rs` table. `helpers.rs`, `mop_up.rs`, and `insufficient_material.rs` support it. `variants/` exists for cases where a variant needs genuinely different scoring rather than a tiny rules tweak.
 
 Evaluation should mostly read already-maintained state and turn it into a score. If it has to rediscover basic positional facts from scratch, something is probably in the wrong place.
+
+### `src/eval_net/`
+
+This is the learned correction to the evaluators.
+
+It is not NNUE. The Generic net reads a vector of 121 scalars the hand-crafted evaluation already computes on its way to a score (term values per side, material counts, king and cloud geometry), read as side to move vs. opponent. A small quantized MLP turns that into a residual, capped at ±500 cp, which `base::evaluate` adds to the HCE score. `features.rs` defines the input layout, `inference.rs` the integer forward pass, and `weights.rs` loads the blob embedded from `eval_net.bin`.
+
+The Chess, Obstocean and Pawn Horde evaluators each have their own smaller net (`*_net.bin`). Its inputs are that evaluator's own terms, written during its normal pass through a `VariantSink` (`variant_features.rs`), so it costs no second eval. The nets are off against a bare king, where mop-up owns the gradient. `APEIRON_EVAL_NET=0` disables them all at runtime.
+
+Because the net reads HCE terms, it is trained against one specific HCE. Changing an eval term changes its inputs, so the net has to be retrained (see the Contributing Guide). Training tooling lives in `evalnet/`.
 
 ### `tests/`
 
@@ -175,6 +186,10 @@ Zobrist hashing is part of the engine's core plumbing, not an optional optimizat
 ### Variant support
 
 Variants are not a bolt-on. Rule differences live in `GameRules`/`GameState`, and evaluation has a separate `variants/` layer for cases that need custom scoring.
+
+### HCE and net coupling
+
+The HCE and the eval net are one evaluator. The net's inputs are the HCE's terms, so neither can be tuned in isolation: an eval change ships with a net retrained on top of it, and that pair has to beat HEAD.
 
 ### Infinite-board assumptions
 

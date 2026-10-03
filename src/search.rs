@@ -122,6 +122,18 @@ fn get_noise(seed: u64, hash: u64, amp: i32) -> i32 {
 
 pub const MAX_PLY: usize = 64;
 pub const MAX_QSEARCH_DEPTH: usize = 16;
+/// Qsearch ply from which a non-recapture must win material (SEE > 0) to be searched.
+const QS_EVEN_TRADE_PLY: usize = 4;
+
+/// Set by the engine's time manager to the most of the clock one move may use; read
+/// once per search into `SearcherHot::clock_cap_ms`. `u64::MAX` = no clock.
+static CLOCK_CAP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Publish the clock cap for the next search (`u64::MAX` when it is not clock-driven).
+pub fn set_clock_cap_ms(ms: u64) {
+    CLOCK_CAP_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub const INFINITY: i32 = 1_000_000;
 
 /// Far quiet slider pruning: distance at which a quiet slider move counts as
@@ -150,20 +162,26 @@ pub const fn mated_in(ply: usize) -> i32 {
 }
 
 #[inline(always)]
-fn win_condition_for_side(game: &GameState, color: PlayerColor) -> WinCondition {
-    match color {
-        PlayerColor::White => game.game_rules.white_win_condition,
-        PlayerColor::Black => game.game_rules.black_win_condition,
-        PlayerColor::Neutral => WinCondition::Checkmate,
-    }
-}
-
-#[inline(always)]
 fn opponent_win_condition_for_side(game: &GameState, color: PlayerColor) -> WinCondition {
     match color {
         PlayerColor::White => game.game_rules.black_win_condition,
         PlayerColor::Black => game.game_rules.white_win_condition,
         PlayerColor::Neutral => WinCondition::Checkmate,
+    }
+}
+
+/// Whether capturing one of `victim`'s royals ends the game: always under RoyalCapture,
+/// and under AllRoyalsCaptured once only one is left.
+#[inline(always)]
+fn royal_capture_decides(game: &GameState, victim: PlayerColor) -> bool {
+    match opponent_win_condition_for_side(game, victim) {
+        WinCondition::RoyalCapture => true,
+        WinCondition::AllRoyalsCaptured => match victim {
+            PlayerColor::White => game.white_royals.len() == 1,
+            PlayerColor::Black => game.black_royals.len() == 1,
+            PlayerColor::Neutral => false,
+        },
+        _ => false,
     }
 }
 
@@ -185,15 +203,26 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 /// when the wasm memory is shared, so `check_time` polls it every node batch.
 pub(crate) static GLOBAL_STOP: AtomicBool = AtomicBool::new(false);
 
-/// Per-thread node counter for thread-aggregated NPS (Stockfish-style: total nodes across all
-/// search threads / wall-clock). Each slot is cache-line aligned so threads publishing their
-/// own counts never bounce a shared line (no false sharing).
+/// Node budget of each search thread (`u64::MAX` = none). Only searches with no time limit
+/// honor it, except in data_gen builds, where every search does.
+static NODE_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Sets [`NODE_LIMIT`]; 0 means none. It persists until set again.
+pub fn set_node_limit(nodes: u64) {
+    let limit = if nodes == 0 { u64::MAX } else { nodes };
+    NODE_LIMIT.store(limit, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Per-thread node counter for aggregated NPS. Each slot is cache-line aligned so
+/// threads publishing their own counts never bounce a shared line.
 #[cfg(feature = "multithreading")]
 #[repr(align(64))]
 pub(crate) struct NodeSlot(std::sync::atomic::AtomicU64);
 
+/// No thread cap exists (the page sizes the pool to the core count), so this only has
+/// to exceed any real core count; past it, threads share slots and NPS undercounts.
 #[cfg(feature = "multithreading")]
-pub(crate) const SEARCH_NODE_SLOTS: usize = 16;
+pub(crate) const SEARCH_NODE_SLOTS: usize = 256;
 #[cfg(feature = "multithreading")]
 pub(crate) static SEARCH_THREAD_NODES: [NodeSlot; SEARCH_NODE_SLOTS] =
     [const { NodeSlot(std::sync::atomic::AtomicU64::new(0)) }; SEARCH_NODE_SLOTS];
@@ -227,6 +256,17 @@ pub(crate) fn aggregate_search_nodes() -> u64 {
 /// Transposition table size in MB used when (re)creating searchers and the shared TT.
 pub(crate) static TT_SIZE_MB: AtomicUsize = AtomicUsize::new(16);
 
+/// Helper threads route every probe and store to the shared table, so their own
+/// table is pure waste: 16 wasm threads held 1 GB of it at the 64 MB wasm cap.
+#[inline]
+fn local_tt_size_mb() -> usize {
+    #[cfg(feature = "multithreading")]
+    if USE_SHARED_TT.load(std::sync::atomic::Ordering::Relaxed) {
+        return 1;
+    }
+    TT_SIZE_MB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Sets the TT size for future searcher/shared-TT creations, and resizes the
 /// current thread's persistent searcher's local TT immediately if one exists.
 /// An already-initialized shared TT cannot be resized; respawn the worker for that.
@@ -236,7 +276,7 @@ pub fn set_tt_size_mb(mb: usize) {
     TT_SIZE_MB.store(mb.clamp(1, 4096), std::sync::atomic::Ordering::Relaxed);
     GLOBAL_SEARCHER.with(|cell| {
         if let Some(searcher) = cell.borrow_mut().as_mut() {
-            searcher.tt = LocalTranspositionTable::new(mb);
+            searcher.tt = LocalTranspositionTable::new(local_tt_size_mb());
         }
     });
 }
@@ -282,10 +322,13 @@ pub const LOW_PLY_HISTORY_MASK: usize = LOW_PLY_HISTORY_ENTRIES - 1;
 
 // Pawn History constants:
 // Tracks successful moves under specific pawn structures.
-pub const PAWN_HISTORY_SIZE: usize = 2048;
+pub const PAWN_HISTORY_SIZE: usize = 1024;
 pub const PAWN_HISTORY_MASK: u64 = (PAWN_HISTORY_SIZE - 1) as u64;
 
 /// [pawn_hash % SIZE][piece_type][to_hash] -> history score.
+/// `[side of the reply][previous from bucket][previous to bucket]` -> (piece, to x, to y).
+pub type CounterMoveTable = [[[(u8, i32, i32); 256]; 256]; 2];
+
 pub type PawnHistTable = [[[i16; 256]; 32]; PAWN_HISTORY_SIZE];
 
 /// Allocates a Box<T> with all-zero bytes without a memset (calloc: pages fault in on use).
@@ -300,8 +343,8 @@ fn zeroed_box<T>() -> Box<T> {
     }
 }
 
-/// One pawn-history table shared by every search thread (Stockfish shares pawn history
-/// across threads too). Concurrent i16 gravity updates race benignly, like the shared TT.
+/// One pawn-history table shared by every search thread. Concurrent i16 gravity
+/// updates race benignly, like the shared TT.
 #[cfg(feature = "multithreading")]
 mod shared_hist {
     pub struct Shared<T>(pub std::cell::UnsafeCell<T>);
@@ -423,6 +466,16 @@ fn get_lmr(depth: usize, moves: usize) -> i32 {
 /// Set to true when parallel search is active.
 #[cfg(feature = "multithreading")]
 pub(crate) static USE_SHARED_TT: AtomicBool = AtomicBool::new(false);
+
+/// Routes a single-threaded search through the shared table, so the wasm harness
+/// can time the per-thread cost of the build the site runs with helper threads.
+#[cfg(all(feature = "multithreading", feature = "bench_positions"))]
+pub fn bench_use_shared_tt(on: bool) {
+    if on {
+        init_shared_tt();
+    }
+    USE_SHARED_TT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Helper struct to satisfy closure syntax in get_or_init
 pub struct TranspositionTable;
@@ -634,9 +687,14 @@ pub struct SearcherHot {
     pub time_limit_ms: u128,
     pub stopped: bool,
     pub seldepth: usize,
+    /// Depth of the current root iteration, for capping stacked extensions.
+    pub root_depth: usize,
     /// Tracks the minimum depth that must be completed before time stops are allowed.
     /// Set to 1 at search start, cleared to 0 after depth 1 completes.
     pub min_depth_required: usize,
+    /// Most of the clock this move may burn before flagging (`CLOCK_CAP_MS` at search
+    /// start); `u128::MAX` when the search is not clock-driven.
+    pub clock_cap_ms: u128,
     /// Optimum time to use for this search (soft limit)
     pub optimum_time_ms: u128,
     /// Maximum time to use for this search (hard limit)
@@ -649,8 +707,10 @@ pub struct SearcherHot {
     pub best_move_nodes: u64,
     /// Running average score smoothed across iterations
     pub best_previous_average_score: i32,
-    /// Root is deep enough and the score decisive enough that mate hunting is
-    /// on: static shortcuts stop being trustworthy (mirrors Stockfish seekMate).
+    /// The previous search's root score, which seeds the falling-eval reference.
+    pub last_root_score: i32,
+    /// Root is deep enough and the score decisive enough that mate hunting is on:
+    /// static shortcuts stop being trustworthy.
     pub seek_mate: bool,
     /// Running scores for falling eval (circular buffer of last 4 iterations)
     pub iter_values: [i32; 4],
@@ -714,6 +774,8 @@ impl SearcherHot {
     /// near the full budget; a hard limit stays conservative and leaves headroom for
     /// the dynamic factors, which multiply optimum and are capped at maximum.
     pub fn set_time_limits(&mut self, opt_ms: u128, max_ms: u128, is_soft: bool) {
+        let cap = CLOCK_CAP_MS.load(std::sync::atomic::Ordering::Relaxed);
+        self.clock_cap_ms = if cap == u64::MAX { u128::MAX } else { cap as u128 };
         self.optimum_time_ms = opt_ms;
         self.maximum_time_ms = max_ms;
         self.is_soft_limit = is_soft;
@@ -789,12 +851,20 @@ pub struct ThreadResult {
     pub thread_id: usize,
 }
 
-/// Picks the winning thread's result index by weighted voting, a port of Stockfish
-/// `get_best_thread`. Each move accrues `(score - minScore + 14) * completedDepth`
-/// votes; decisive scores win outright and a proven loss is never switched to.
+/// Picks the winning thread's result by weighted voting: each move accrues
+/// `(score - minScore + 14) * completedDepth`. Decisive scores win outright and a
+/// proven loss is never switched to.
 #[cfg(feature = "multithreading")]
 fn select_best_thread(all_results: &[ThreadResult]) -> usize {
-    let min_score = all_results.iter().map(|r| r.score).min().unwrap_or(0);
+    // A helper stopped inside its first iteration reports -INFINITY; as the minimum
+    // it would swamp every score difference, leaving only depth to decide the vote.
+    let finished = |r: &ThreadResult| r.score != -INFINITY && r.completed_depth > 0;
+    let min_score = all_results
+        .iter()
+        .filter(|r| finished(r))
+        .map(|r| r.score)
+        .min()
+        .unwrap_or(0);
 
     let move_key = |m: &Move| {
         (
@@ -808,7 +878,7 @@ fn select_best_thread(all_results: &[ThreadResult]) -> usize {
 
     let mut votes: rustc_hash::FxHashMap<(i64, i64, i64, i64, u8), i64> =
         rustc_hash::FxHashMap::default();
-    for r in all_results {
+    for r in all_results.iter().filter(|r| finished(r)) {
         let vote_value = (r.score - min_score + 14) as i64 * r.completed_depth as i64;
         *votes.entry(move_key(&r.best_move)).or_insert(0) += vote_value;
     }
@@ -819,6 +889,13 @@ fn select_best_thread(all_results: &[ThreadResult]) -> usize {
     let mut best_idx = 0;
     for (i, r) in all_results.iter().enumerate() {
         let best = &all_results[best_idx];
+        if !finished(r) {
+            continue;
+        }
+        if !finished(best) {
+            best_idx = i;
+            continue;
+        }
 
         let best_vote = votes.get(&move_key(&best.best_move)).copied().unwrap_or(0);
         let new_vote = votes.get(&move_key(&r.best_move)).copied().unwrap_or(0);
@@ -927,12 +1004,11 @@ pub struct Searcher {
 
     // Triangular PV table: flat array indexed by pv_table[ply * MAX_PLY + offset]
     // Using Box to avoid stack overflow with 64*64 = 4096 Move entries
-    /// The PV of the last completed iteration, and whether the current node is
-    /// still walking it. Stockfish exempts such nodes from IIR so the line the
-    /// engine currently believes in is not reduced out from under it.
+    /// The PV of the last completed iteration, and whether this node is still
+    /// walking it. Nodes on it are exempt from in-move pruning at PV nodes.
     pub prev_iteration_pv: Vec<Move>,
-    /// Exact move played at ply 0 this iteration. The root keeps only hashed coords
-    /// in prev_move_stack, and move_history is written by the interior loop.
+    /// Exact move played at ply 0. The root keeps only hashed coords in
+    /// prev_move_stack, and move_history is written by the interior loop.
     pub root_played: Option<Move>,
     pub follow_pv: Vec<bool>,
     pub pv_table: Box<[Option<Move>; MAX_PLY * MAX_PLY]>,
@@ -950,7 +1026,8 @@ pub struct Searcher {
 
     // Countermove heuristic [prev_from_hash][prev_to_hash] -> (piece_type, to_x, to_y)
     // Stores the move that refuted the previous move (for quiet beta cutoffs).
-    pub countermoves: Box<[[(u8, i32, i32); 256]; 256]>,
+    /// `[side of the reply][previous from bucket][previous to bucket]`.
+    pub countermoves: Box<CounterMoveTable>,
 
     // Previous move info for countermove heuristic (from_hash, to_hash)
     pub prev_move_stack: Vec<(usize, usize)>,
@@ -974,6 +1051,9 @@ pub struct Searcher {
     pub completed_depth: usize,
     /// Evaluator family the cached scores and histories were produced under.
     pub last_eval_kind: Option<crate::evaluation::eval_kind::EvalKind>,
+    /// Skill levels scale the eval, so their cached scores must not reach a search
+    /// at another style (and vice versa).
+    pub last_eval_style: Option<crate::evaluation::EvalStyle>,
 
     // Silent mode - no info output
     pub silent: bool,
@@ -987,7 +1067,9 @@ pub struct Searcher {
     pub helper_epoch: u64,
 
     // Per-ply reusable move buffers using Stack/Heap-allocated MoveList (SmallVec)
-    pub move_buffers: Vec<MoveList>,
+    /// Boxed so qsearch can take one out with an 8-byte move; swapping the
+    /// 8 KB inline SmallVec cost four memcpys on half the nodes.
+    pub move_buffers: Vec<Option<Box<MoveList>>>,
 
     // Move history stack for continuation history (move at each ply)
     pub move_history: Vec<Option<Move>>,
@@ -999,7 +1081,9 @@ pub struct Searcher {
     // Continuation history, keyed by ply offset (1, 2 and 4 plies ago) then capture,
     // check, previous piece and the from/to hashes. The gravity update self-bounds to
     // 16384, so i16 is lossless and the search's hottest table stays at 25MB.
-    pub cont_history: Box<[[[[[[[i16; 16]; 16]; 16]; 32]; 2]; 2]; 3]>,
+    /// Indexed `[ply slot + 3 * side of the move being scored]`: as with main history,
+    /// White's and Black's moves get separate tables.
+    pub cont_history: Box<[[[[[[[i16; 16]; 16]; 16]; 32]; 2]; 2]; 6]>,
 
     // MultiPV: moves to exclude from root search (for finding 2nd, 3rd, etc. best moves)
     // Stored as (from_x, from_y, to_x, to_y) tuples for fast comparison without cloning
@@ -1014,7 +1098,7 @@ pub struct Searcher {
     pub minor_corrhist: Box<[[i32; CORRHIST_SIZE]; 2]>,
 
     pub material_corrhist: Box<[[i32; CORRHIST_SIZE]; 2]>,
-    pub lastmove_corrhist: Box<[i32; LASTMOVE_CORRHIST_SIZE]>,
+    pub lastmove_corrhist: Box<[[i32; LASTMOVE_CORRHIST_SIZE]; 2]>,
 
     // Stacks to track node state for history updates
     pub in_check_history: Vec<bool>,
@@ -1029,6 +1113,8 @@ pub struct Searcher {
 
     /// Per-ply reduction applied, so a child can adjust depth in hindsight.
     pub reduction_stack: Vec<i32>,
+    /// 1-based index of the move searched at each ply, for early-move history rules.
+    pub move_count_stack: Vec<u16>,
 
     /// Cutoffs per ply, raising LMR when the next ply fails high often.
     pub cutoff_cnt: Vec<u8>,
@@ -1052,18 +1138,6 @@ pub struct Searcher {
     pub plies_from_null: Box<[u8; MAX_PLY]>,
     pub tt: LocalTranspositionTable,
 
-    /// Accumulator for the position at each ply, after the parent's move. Sized
-    /// `MAX_PLY + 2` so the deepest ply still has a child slot, and only maintained
-    /// while `nnue_active`.
-    #[cfg(feature = "nnue")]
-    pub nnue_stack: Box<[crate::nnue::NnueState; MAX_PLY + 2]>,
-    /// Scratch buffer used by singular extension to save/restore
-    /// `nnue_stack[ply+1]` across the singular verification search.
-    #[cfg(feature = "nnue")]
-    pub nnue_scratch: Box<crate::nnue::NnueState>,
-    /// Whether NNUE evaluation is currently active for this search.
-    #[cfg(feature = "nnue")]
-    pub nnue_active: bool,
 }
 
 impl Searcher {
@@ -1076,9 +1150,9 @@ impl Searcher {
             killers.push([None, None]);
         }
 
-        let mut move_buffers: Vec<MoveList> = Vec::with_capacity(MAX_PLY);
+        let mut move_buffers: Vec<Option<Box<MoveList>>> = Vec::with_capacity(MAX_PLY);
         for _ in 0..MAX_PLY {
-            move_buffers.push(MoveList::new());
+            move_buffers.push(Some(Box::new(MoveList::new())));
         }
 
         Searcher {
@@ -1089,13 +1163,16 @@ impl Searcher {
                 time_limit_ms,
                 stopped: false,
                 seldepth: 0,
+                root_depth: 0,
                 min_depth_required: 1, // Must complete at least depth 1
+                clock_cap_ms: u128::MAX,
                 optimum_time_ms: 0,
                 maximum_time_ms: 0,
                 tot_best_move_changes: 0.0,
                 best_move_changes: 0.0,
                 best_move_nodes: 0,
                 best_previous_average_score: 0,
+                last_root_score: 0,
                 seek_mate: false,
                 iter_values: [0; 4],
                 iter_idx: 0,
@@ -1124,8 +1201,8 @@ impl Searcher {
             },
             countermoves: unsafe {
                 Box::from_raw(
-                    Box::into_raw(vec![(0u8, 0i32, 0i32); 256 * 256].into_boxed_slice())
-                        as *mut [[(u8, i32, i32); 256]; 256],
+                    Box::into_raw(vec![(0u8, 0i32, 0i32); 2 * 256 * 256].into_boxed_slice())
+                        as *mut CounterMoveTable,
                 )
             },
             in_check_history: vec![false; MAX_PLY],
@@ -1141,6 +1218,7 @@ impl Searcher {
             rng: Prng::new(0),
             completed_depth: 0,
             last_eval_kind: None,
+            last_eval_style: None,
             silent: false,
             thread_id: 0,
             helper_epoch: 0,
@@ -1149,9 +1227,9 @@ impl Searcher {
             moved_piece_history: vec![0; MAX_PLY],
             cont_history: unsafe {
                 Box::from_raw(Box::into_raw(
-                    vec![0i16; 3 * 2 * 2 * 32 * 16 * 16 * 16].into_boxed_slice(),
+                    vec![0i16; 6 * 2 * 2 * 32 * 16 * 16 * 16].into_boxed_slice(),
                 )
-                    as *mut [[[[[[[i16; 16]; 16]; 16]; 32]; 2]; 2]; 3])
+                    as *mut [[[[[[[i16; 16]; 16]; 16]; 32]; 2]; 2]; 6])
             },
             excluded_moves: Vec::new(),
             nonpawn_corrhist: unsafe {
@@ -1172,14 +1250,10 @@ impl Searcher {
                         as *mut [[i32; CORRHIST_SIZE]; 2],
                 )
             },
-            lastmove_corrhist: unsafe {
-                Box::from_raw(
-                    Box::into_raw(vec![0i32; LASTMOVE_CORRHIST_SIZE].into_boxed_slice())
-                        as *mut [i32; LASTMOVE_CORRHIST_SIZE],
-                )
-            },
+            lastmove_corrhist: Box::new([[0; LASTMOVE_CORRHIST_SIZE]; 2]),
             tt_move_history: 0,
             reduction_stack: vec![0; MAX_PLY],
+            move_count_stack: vec![0; MAX_PLY],
             cutoff_cnt: vec![0; MAX_PLY + 2], // +2 for (ply+2) access pattern
             move_rule_limit: 100,             // Default, will be updated from GameState
             contempt: CONTEMPT,
@@ -1196,98 +1270,8 @@ impl Searcher {
             },
             #[cfg(not(feature = "multithreading"))]
             pawn_history: zeroed_box(),
-            tt: LocalTranspositionTable::new(TT_SIZE_MB.load(std::sync::atomic::Ordering::Relaxed)),
+            tt: LocalTranspositionTable::new(local_tt_size_mb()),
 
-            #[cfg(feature = "nnue")]
-            nnue_stack: {
-                let v: Vec<crate::nnue::NnueState> = (0..MAX_PLY + 2)
-                    .map(|_| crate::nnue::NnueState::default())
-                    .collect();
-                unsafe {
-                    Box::from_raw(Box::into_raw(v.into_boxed_slice())
-                        as *mut [crate::nnue::NnueState; MAX_PLY + 2])
-                }
-            },
-            #[cfg(feature = "nnue")]
-            nnue_scratch: Box::new(crate::nnue::NnueState::default()),
-            #[cfg(feature = "nnue")]
-            nnue_active: false,
-        }
-    }
-
-    // NNUE accumulator stack helpers. The accumulator for the position at
-    // `ply` lives in `self.nnue_stack[ply]`. Helpers here update child slot
-    // `ply+1` before recursion without heap allocation.
-
-    /// Initialize `nnue_stack[0]` from the root position and mark NNUE as
-    /// active for the remainder of this search. Call once per top-level
-    /// search if NNUE applies; otherwise set `nnue_active = false`.
-    #[cfg(feature = "nnue")]
-    #[inline]
-    pub fn nnue_init_root(&mut self, game: &GameState) {
-        if crate::nnue::is_applicable(game) {
-            self.nnue_stack[0] = crate::nnue::NnueState::from_position(game);
-            self.nnue_active = true;
-        } else {
-            self.nnue_active = false;
-        }
-    }
-
-    /// Copies `nnue_stack[ply]` forward and applies the feature delta for `m`. Must be
-    /// called while `game` is still in the pre-move state.
-    #[cfg(feature = "nnue")]
-    #[inline]
-    pub fn nnue_push_move(&mut self, game: &GameState, ply: usize, m: Move) {
-        if !self.nnue_active || ply + 1 >= self.nnue_stack.len() {
-            return;
-        }
-        let (left, right) = self.nnue_stack.split_at_mut(ply + 1);
-        right[0].clone_from(&left[ply]);
-        right[0].update_for_move(game, m);
-    }
-
-    /// Copy `nnue_stack[ply]` into `nnue_stack[ply+1]` unchanged (used for
-    /// null-move search: a null move does not change piece positions, so
-    /// the accumulator is identical).
-    #[cfg(feature = "nnue")]
-    #[inline]
-    pub fn nnue_push_null(&mut self, ply: usize) {
-        if !self.nnue_active || ply + 1 >= self.nnue_stack.len() {
-            return;
-        }
-        let (left, right) = self.nnue_stack.split_at_mut(ply + 1);
-        right[0].clone_from(&left[ply]);
-    }
-
-    /// Save `nnue_stack[ply]` to scratch (for singular extension, before
-    /// the inner verification search clobbers it).
-    #[cfg(feature = "nnue")]
-    #[inline]
-    pub fn nnue_save_scratch(&mut self, ply: usize) {
-        if !self.nnue_active || ply >= self.nnue_stack.len() {
-            return;
-        }
-        (*self.nnue_scratch).clone_from(&self.nnue_stack[ply]);
-    }
-
-    /// Restore `nnue_stack[ply]` from scratch (after singular verification).
-    #[cfg(feature = "nnue")]
-    #[inline]
-    pub fn nnue_restore_scratch(&mut self, ply: usize) {
-        if !self.nnue_active || ply >= self.nnue_stack.len() {
-            return;
-        }
-        self.nnue_stack[ply].clone_from(&*self.nnue_scratch);
-    }
-
-    /// Borrow the NNUE accumulator for a given ply if active.
-    #[cfg(feature = "nnue")]
-    #[inline]
-    pub fn nnue_at(&self, ply: usize) -> Option<&crate::nnue::NnueState> {
-        if self.nnue_active {
-            self.nnue_stack.get(ply)
-        } else {
-            None
         }
     }
 
@@ -1325,18 +1309,6 @@ impl Searcher {
         false
     }
 
-    /// Decay history scores at the start of each iteration
-    #[inline]
-    pub fn decay_history(&mut self) {
-        for side in self.history.iter_mut() {
-            for row in side.iter_mut() {
-                for val in row.iter_mut() {
-                    *val = *val * 9 / 10; // Decay by 10%
-                }
-            }
-        }
-    }
-
     /// Start a new search: reset per-search state and increment TT age (or clear if requested).
     pub fn new_search(&mut self) {
         // Only the coordinating thread (thread_id 0) bumps the shared generation.
@@ -1356,14 +1328,18 @@ impl Searcher {
 
         // Reset search control
         self.hot.min_depth_required = 1;
+        // A search stopped before its first root move completes must not hand back the
+        // previous position's best move, which may be illegal here.
+        self.pv_table[0] = None;
+        self.pv_length[0] = 0;
 
         // Reset time management variables
         self.hot.tot_best_move_changes = 0.0;
         self.hot.best_move_changes = 0.0;
         self.hot.best_move_nodes = 0;
-        self.hot.best_previous_average_score = 0;
+        self.hot.best_previous_average_score = self.hot.last_root_score;
         self.hot.seek_mate = false;
-        self.hot.iter_values.fill(0);
+        self.hot.iter_values.fill(self.hot.last_root_score);
         self.hot.iter_idx = 0;
         self.hot.prev_time_reduction = 1.0;
         self.hot.last_best_move_depth = 0;
@@ -1388,14 +1364,21 @@ impl Searcher {
         // Reset StatScore stack
         self.stat_score_stack.fill(0);
 
-        // Age main history between searches, as Stockfish does (729/1024). It
-        // persisted undecayed here, so a move's credit from many moves ago counted
-        // as much as one earned in the position actually on the board.
+        // Age history between searches, or credit earned in the opening still
+        // counts at full weight hundreds of plies later.
         for side in self.history.iter_mut() {
             for piece in side.iter_mut() {
                 for v in piece.iter_mut() {
                     *v = *v * 729 / 1024;
                 }
+            }
+        }
+
+        // Capture history has the same staleness problem and is only 4 KB, so the
+        // pass is free next to the 64 KB main table above.
+        for victim in self.capture_history.iter_mut() {
+            for v in victim.iter_mut() {
+                *v = *v * 729 / 1024;
             }
         }
 
@@ -1410,14 +1393,19 @@ impl Searcher {
     /// so a kind change between searches (a custom position, or a mid-game
     /// re-detection) resets the table and histories instead of reusing them.
     pub fn adopt_eval_kind(&mut self, kind: crate::evaluation::eval_kind::EvalKind) {
-        if self.last_eval_kind.is_some() && self.last_eval_kind != Some(kind) {
+        let style = crate::evaluation::base::eval_style();
+        if (self.last_eval_kind.is_some() && self.last_eval_kind != Some(kind))
+            || (self.last_eval_style.is_some() && self.last_eval_style != Some(style))
+        {
             self.clear();
         }
         self.last_eval_kind = Some(kind);
+        self.last_eval_style = Some(style);
     }
 
     /// Clears TT and resets all history tables to neutral values.
     pub fn clear(&mut self) {
+        self.hot.last_root_score = 0;
         // Clear transposition table
         #[cfg(feature = "multithreading")]
         if let Some(tt) = SHARED_TT.get() {
@@ -1441,7 +1429,7 @@ impl Searcher {
         }
 
         // Reset continuation history
-        for idx in 0..3 {
+        for idx in 0..6 {
             for c in 0..2 {
                 for ic in 0..2 {
                     for p in 0..32 {
@@ -1465,7 +1453,9 @@ impl Searcher {
         for row in self.material_corrhist.iter_mut() {
             row.fill(0);
         }
-        self.lastmove_corrhist.fill(0);
+        for row in self.lastmove_corrhist.iter_mut() {
+            row.fill(0);
+        }
 
         for row in self.low_ply_history.iter_mut() {
             row.fill(0);
@@ -1490,7 +1480,7 @@ impl Searcher {
         }
 
         // Reset countermoves
-        for row in self.countermoves.iter_mut() {
+        for row in self.countermoves.iter_mut().flatten() {
             for val in row.iter_mut() {
                 *val = (0, 0, 0);
             }
@@ -1554,6 +1544,39 @@ impl Searcher {
         self.moved_piece_history[ply] = backup.piece;
         self.in_check_history[ply] = backup.in_check;
         self.capture_history_stack[ply] = backup.capture;
+    }
+
+    /// Adds `delta` to the continuation-history entries of the move played at
+    /// `ply - 1`, keyed on its ancestors 1, 2 and 4 plies further back.
+    pub fn update_prior_cont_history(&mut self, ply: usize, delta: i32) {
+        let Some(prev_move) = self.move_history[ply - 1] else { return };
+        if self.moved_piece_history[ply - 1] as usize >= 32 {
+            return;
+        }
+        let max_h = params::history_max_gravity();
+        let from_h = hash_coord_16(prev_move.from.x, prev_move.from.y);
+        let to_h = hash_coord_16(prev_move.to.x, prev_move.to.y);
+        const CONT_WEIGHTS: [i32; 3] = [1024, 712, 410];
+        let prior_in_check = self.in_check_history[ply - 1];
+        for (idx, &plies_ago) in [1usize, 2, 4].iter().enumerate() {
+            if prior_in_check && plies_ago > 2 {
+                break;
+            }
+            let Some(tp) = (ply - 1).checked_sub(plies_ago) else { continue };
+            let Some(anc) = self.move_history[tp] else { continue };
+            let anc_piece = self.moved_piece_history[tp] as usize;
+            if anc_piece >= 32 {
+                continue;
+            }
+            let anc_to = hash_coord_16(anc.to.x, anc.to.y);
+            let anc_ic = self.in_check_history[tp] as usize;
+            let anc_cap = self.capture_history_stack[tp] as usize;
+            let adj = (delta.clamp(-max_h, max_h) * CONT_WEIGHTS[idx]) / 1024;
+            let slot = idx + 3 * hist_color(prev_move.piece.color());
+            let entry = &mut self.cont_history[slot][anc_cap][anc_ic][anc_piece][anc_to][from_h][to_h];
+            let cur = *entry as i32;
+            *entry = (cur + adj - ((cur * adj.abs()) >> 14)) as i16;
+        }
     }
 
     /// Gravity-style history update: scales updates based on current value and clamps to [-MAX_HISTORY, MAX_HISTORY].
@@ -1647,6 +1670,11 @@ impl Searcher {
                 self.hot.stopped = true;
                 return true;
             }
+            #[cfg(feature = "data_gen")]
+            if self.hot.nodes >= NODE_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
+                self.hot.stopped = true;
+                return true;
+            }
             #[cfg(feature = "multithreading")]
             if self.helper_epoch != 0
                 && HELPER_EPOCH.load(std::sync::atomic::Ordering::Relaxed) != self.helper_epoch
@@ -1656,13 +1684,39 @@ impl Searcher {
             }
         }
 
-        // Fast-path: no time limit (unlimited analysis slices, offline test/perft helpers).
+        // Fast-path: no time limit (unlimited or node-limited analysis, offline test/perft
+        // helpers). Timed searches never get here, so the node budget costs them nothing.
         if self.hot.time_limit_ms == u128::MAX {
+            #[cfg(not(feature = "data_gen"))] // data_gen already checks it above, for every search.
+            if self.hot.nodes & 4095 == 0
+                && self.hot.nodes >= NODE_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.hot.stopped = true;
+                return true;
+            }
             return false;
         }
 
-        // Don't stop until we've completed at least depth 1
+        // Don't stop until we've completed at least depth 1, unless the clock itself is
+        // at stake: a capture melee can blow up one depth-1 qsearch past the whole budget,
+        // and a flag loses outright where the best move so far would not.
         if self.hot.min_depth_required > 0 {
+            if self.hot.nodes & 4095 == 0 {
+                // The clock's own cap, not the move's budget: at low clock the budget
+                // shrinks to a fraction of the increment, and cutting depth 1 there
+                // plays a half-searched move with time still on the clock.
+                let hard_limit = if self.hot.clock_cap_ms != u128::MAX {
+                    self.hot.clock_cap_ms
+                } else if self.hot.maximum_time_ms > 0 {
+                    self.hot.maximum_time_ms
+                } else {
+                    self.hot.time_limit_ms
+                };
+                if self.hot.timer.elapsed_ms() >= hard_limit {
+                    self.hot.stopped = true;
+                    return true;
+                }
+            }
             return false;
         }
 
@@ -1692,11 +1746,11 @@ impl Searcher {
                 }
             }
 
-            // If the current depth ALONE has consumed > 50% of the move budget, return.
+            // An iteration may run to the full move budget; no new one starts past half of it.
             // ONLY for hard limits. For soft limits (fixed time), we want to use all time.
             if !self.hot.is_soft_limit
                 && self.hot.total_time_ms > 0.0
-                && elapsed - self.hot.iter_start_ms > self.hot.total_time_ms * 0.50
+                && elapsed > self.hot.total_time_ms
             {
                 self.hot.stopped = true;
                 return true;
@@ -1753,7 +1807,7 @@ impl Searcher {
             let mat_corr = self.material_corrhist[color_idx][mat_idx];
 
             let lastmove_idx = prev_move_idx & LASTMOVE_CORRHIST_MASK;
-            let lastmove_corr = self.lastmove_corrhist[lastmove_idx];
+            let lastmove_corr = self.lastmove_corrhist[color_idx][lastmove_idx];
 
             // The opponent's non-pawn structure is separate information, and its
             // slot already holds corrections learned with that side to move, so it
@@ -1791,11 +1845,14 @@ impl Searcher {
         in_check: bool,
         prev_move_idx: usize,
     ) {
-        if in_check || !best_move_is_quiet {
+        // A mate score is no correction to a static eval: one would pin every shared
+        // entry at the limit. Past the limit a target only saturates the average.
+        if in_check || !best_move_is_quiet || is_decisive(search_score) {
             return;
         }
 
-        let diff = search_score - static_eval;
+        let diff = (search_score - static_eval)
+            .clamp(-CORRHIST_LIMIT / CORRHIST_GRAIN, CORRHIST_LIMIT / CORRHIST_GRAIN);
         // PlayerColor is Neutral=0/White=1/Black=2. Map White->0, Black->1 so the
         // `color_idx == 0` branch below correctly selects white_nonpawn_hash for White.
         let color_idx = (game.turn as usize).saturating_sub(1);
@@ -1831,7 +1888,7 @@ impl Searcher {
 
             let lastmove_idx = prev_move_idx & LASTMOVE_CORRHIST_MASK;
             let lm_weight = weight.min(64);
-            let lm_entry = &mut self.lastmove_corrhist[lastmove_idx];
+            let lm_entry = &mut self.lastmove_corrhist[color_idx][lastmove_idx];
             *lm_entry = ((*lm_entry as i64 * (CORRHIST_WEIGHT_SCALE - lm_weight) as i64
                 + scaled_diff as i64 * lm_weight as i64)
                 / CORRHIST_WEIGHT_SCALE as i64) as i32;
@@ -2191,6 +2248,8 @@ fn search_with_searcher(
     game: &mut GameState,
     max_depth: usize,
 ) -> Option<(Move, i32)> {
+    game.recenter_windows();
+
     // Root must bypass the slider candidate cache: it is never invalidated, so a
     // persistent GameState accumulates staleness and the root list both loses legal
     // moves and gains impossible ones (measured 84% of positions after 120 plies).
@@ -2223,29 +2282,11 @@ fn search_with_searcher(
         return None;
     }
 
-    // Wall-target generation for lone-king conversions: without it the square
-    // that builds a wall is not in the move list at all past sixteen squares,
-    // because only checks escape the slider distance filter.
-    let bare_conversion = crate::evaluation::mop_up::active_mop_up(game).is_some_and(|(w, _)| {
-        let defender = if w == PlayerColor::White {
-            game.black_piece_count
-        } else {
-            game.white_piece_count
-        };
-        defender == 1
-    });
-    crate::moves::set_wall_targets(bare_conversion, &game.spatial_indices);
-
-    // Initialize NNUE accumulator stack for this search (stored on searcher).
-    #[cfg(feature = "nnue")]
-    searcher.nnue_init_root(game);
+    set_conversion_wall_targets(game);
 
     // If only one move, return immediately with a simple static eval as score.
     if legal_moves.len() == 1 {
         let single = legal_moves[0];
-        #[cfg(feature = "nnue")]
-        let score = searcher.adjusted_eval(game, evaluate(game, searcher.nnue_at(0)), 0);
-        #[cfg(not(feature = "nnue"))]
         let score = searcher.adjusted_eval(game, evaluate(game), 0);
         return Some((single, score));
     }
@@ -2417,7 +2458,9 @@ fn search_with_searcher(
             } else {
                 0.0
             };
-            let high_best_move_effort = if nodes_effort >= 93340.0 { 0.76 } else { 1.0 };
+            // Root LMR leaves the other root moves cheap, which raises the best move's
+            // share everywhere, so the early stop needs a higher bar than before.
+            let high_best_move_effort = if nodes_effort >= 96000.0 { 0.76 } else { 1.0 };
 
             searcher.hot.seek_mate = base_depth >= 16 && best_score.abs() >= 4000;
 
@@ -2485,7 +2528,12 @@ fn search_with_searcher(
         }
     }
 
-    best_move.map(|m| (m, best_score))
+    // An iteration that never finished has no score; -INFINITY would read as a loss.
+    let best_score = if best_score == -INFINITY { 0 } else { best_score };
+    searcher.hot.last_root_score = if is_decisive(best_score) { 0 } else { best_score };
+    // A stop inside depth 1 may leave no searched root move; the first ordered legal
+    // move still beats returning nothing.
+    best_move.or_else(|| legal_moves.first().copied()).map(|m| (m, best_score))
 }
 
 /// Time-limited search that returns the best move, its evaluation (cp from side-to-move's
@@ -2522,12 +2570,21 @@ pub fn get_best_move_parallel(
     GLOBAL_STOP.store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Lazy SMP runs only where a thread pool was explicitly provisioned. Native
-    // builds stay single-threaded: parallelism there belongs to the caller, which
-    // must not share the global stop and TT coordination.
+    // builds stay single-threaded unless APEIRON_THREADS asks otherwise (SMP
+    // matches): parallelism there belongs to the caller, which must not share the
+    // global stop and TT coordination.
     #[cfg(target_arch = "wasm32")]
     let num_threads = rayon::current_num_threads().max(1);
     #[cfg(not(target_arch = "wasm32"))]
-    let num_threads = 1;
+    let num_threads = {
+        static NATIVE_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *NATIVE_THREADS.get_or_init(|| {
+            std::env::var("APEIRON_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map_or(1, |n| n.max(1))
+        })
+    };
 
     USE_SHARED_TT.store(num_threads > 1, std::sync::atomic::Ordering::Relaxed);
 
@@ -2632,7 +2689,7 @@ pub fn get_best_move_parallel(
         return None;
     }
 
-    // Select the winning thread by Stockfish-style weighted voting.
+    // Select the winning thread by weighted voting.
     let best_idx = select_best_thread(&all_results);
     let best_result = &all_results[best_idx];
 
@@ -2698,12 +2755,23 @@ pub fn stop_analysis_helpers() {
     GLOBAL_STOP.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Detached Lazy SMP helper: one continuous unbounded deepening search on a rayon
-/// thread, feeding the shared TT through the worker's JS yields. It retires within a
-/// node batch once `check_time` sees its epoch superseded.
+/// Each analysis helper's latest completed lines, tagged with its epoch, so a slice's
+/// result can be voted across threads the way Stockfish reports its best thread.
+#[cfg(feature = "multithreading")]
+static HELPER_LINES: std::sync::Mutex<Vec<(u64, Vec<PVLine>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Detached Lazy SMP analysis helper: the main thread's MultiPV search, unbounded, on a
+/// rayon thread, sharing the TT and publishing its lines for the vote. It retires within
+/// a node batch once `check_time` sees its epoch superseded.
 #[cfg(feature = "multithreading")]
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub(crate) fn helper_run(mut game: GameState, epoch: u64, thread_id: usize) {
+pub(crate) fn helper_run(
+    mut game: GameState,
+    epoch: u64,
+    thread_id: usize,
+    max_depth: usize,
+    multi_pv: usize,
+) {
     if HELPER_EPOCH.load(std::sync::atomic::Ordering::Relaxed) != epoch {
         return; // Superseded while queued behind the previous batch.
     }
@@ -2723,6 +2791,7 @@ pub(crate) fn helper_run(mut game: GameState, epoch: u64, thread_id: usize) {
         // Unique RNG per helper for search diversity (mirrors get_best_move_threaded).
         let base_seed = searcher.seed;
         searcher.rng = Prng::new(base_seed.wrapping_add(thread_id as u64));
+        searcher.adopt_eval_kind(game.eval_kind);
         searcher.new_search();
 
         searcher.thread_id = thread_id;
@@ -2735,9 +2804,26 @@ pub(crate) fn helper_run(mut game: GameState, epoch: u64, thread_id: usize) {
             .game_rules
             .move_rule_limit
             .map_or(i32::MAX, |v| v as i32);
-        searcher.contempt = CONTEMPT;
-
-        let _ = search_with_searcher(searcher, &mut game, MAX_PLY);
+        // Same search as the main analysis thread (contempt 0, every MultiPV line),
+        // so a helper's lines can stand in for the main thread's when it wins the vote.
+        searcher.contempt = 0;
+        let mut publish = |info: &DepthInfo| {
+            if let Ok(mut slots) = HELPER_LINES.lock() {
+                if slots.len() <= thread_id {
+                    slots.resize(thread_id + 1, (0, Vec::new()));
+                }
+                slots[thread_id] = (epoch, info.lines.to_vec());
+            }
+        };
+        let _ = get_best_moves_multipv_impl(
+            searcher,
+            &mut game,
+            max_depth,
+            multi_pv.max(1),
+            true,
+            None,
+            Some(&mut publish),
+        );
         searcher.helper_epoch = 0;
     });
     HELPERS_LIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -2864,13 +2950,12 @@ pub fn get_best_moves_multipv(
         }
 
         // MultiPV > 1: Search with special root handling to collect multiple best moves
-        get_best_moves_multipv_impl(
-            searcher, game, max_depth, multi_pv, silent, None, None, None,
-        )
+        get_best_moves_multipv_impl(searcher, game, max_depth, multi_pv, silent, None, None)
     })
 }
 
 /// Time-sliced MultiPV search, streaming a [`DepthInfo`] after every completed depth.
+/// `slice_ms` is a hard time limit (0 = run to `max_depth`).
 /// Call it repeatedly, passing `start_depth = last_reached + 1` so each slice resumes
 /// rather than re-walking. The first iteration always completes, so a slice gains one.
 pub fn analyse_position(
@@ -2912,10 +2997,10 @@ pub fn analyse_position(
             searcher.hot.iter_start_ms = 0.0;
             searcher.hot.total_time_ms = 0.0;
         }
-        // No per-node time limit: `check_time` must never abort mid-depth, so every depth
-        // completes fully and its result is deterministic. Responsiveness instead comes
-        // from the between-depth deadline (whole depths only), passed to the impl below.
-        searcher.hot.set_time_limits(u128::MAX, u128::MAX, true);
+        // `check_time` cuts the search off mid-depth once the slice is used up. That never
+        // varies a result: an interrupted depth is discarded, never streamed.
+        let limit_ms = if slice_ms == 0 { u128::MAX } else { slice_ms };
+        searcher.hot.set_time_limits(limit_ms, limit_ms, true);
         searcher.silent = true;
         searcher.thread_id = 0; // Main analysis thread owns node slot 0; helpers use 1..N.
         searcher.hot.timer.reset();
@@ -2925,11 +3010,6 @@ pub fn analyse_position(
             .map_or(i32::MAX, |v| v as i32);
         searcher.contempt = 0;
 
-        // slice_ms == 0 means "run to max_depth" (no deadline); otherwise stop after the
-        // first completed depth past the deadline, so a new position can be picked up
-        // within roughly slice_ms instead of waiting for the whole search.
-        let deadline = if slice_ms == 0 { None } else { Some(slice_ms) };
-
         get_best_moves_multipv_impl(
             searcher,
             game,
@@ -2937,10 +3017,41 @@ pub fn analyse_position(
             multi_pv,
             true,
             Some(start_depth),
-            deadline,
             Some(on_depth),
         )
     })
+}
+
+/// Swaps in a helper's lines when it wins the thread vote over the main analysis thread,
+/// as Stockfish outputs its best thread's PV once a search ends.
+#[cfg(feature = "multithreading")]
+pub fn vote_analysis_lines(result: &mut MultiPVResult) {
+    let epoch = HELPER_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    let Some(main) = result.lines.first() else {
+        return;
+    };
+    let as_vote = |line: &PVLine, thread_id: usize| ThreadResult {
+        best_move: line.mv,
+        score: line.score,
+        completed_depth: line.depth,
+        pv_length: line.pv.len(),
+        nodes: 0,
+        thread_id,
+    };
+    let Ok(slots) = HELPER_LINES.lock() else {
+        return;
+    };
+    let mut voters = vec![as_vote(main, 0)];
+    let mut sources = vec![None];
+    for (i, (e, lines)) in slots.iter().enumerate() {
+        if *e == epoch && lines.len() == result.lines.len() && let Some(top) = lines.first() {
+            voters.push(as_vote(top, i));
+            sources.push(Some(lines));
+        }
+    }
+    if let Some(lines) = sources[select_best_thread(&voters)] {
+        result.lines = lines.clone();
+    }
 }
 
 /// Sets the global seed and re-initializes the PRNG.
@@ -2958,6 +3069,21 @@ pub fn set_global_params(seed: u64, noise_amp: Option<i32>) {
     });
 }
 
+/// Wall-target generation for lone-king conversions: without it the square that
+/// builds a wall is not in the move list at all past sixteen squares, because only
+/// checks escape the slider distance filter. Set per search, since the flag persists.
+fn set_conversion_wall_targets(game: &GameState) {
+    let bare_conversion = crate::evaluation::mop_up::active_mop_up(game).is_some_and(|(w, _)| {
+        let defender = if w == PlayerColor::White {
+            game.black_piece_count
+        } else {
+            game.white_piece_count
+        };
+        defender == 1
+    });
+    crate::moves::set_wall_targets(bare_conversion, &game.spatial_indices);
+}
+
 pub(crate) fn get_best_moves_multipv_impl(
     searcher: &mut Searcher,
     game: &mut GameState,
@@ -2967,21 +3093,14 @@ pub(crate) fn get_best_moves_multipv_impl(
     // When `Some`, resume iterative deepening at this depth instead of starting from 1
     // (relies on a warm TT from a previous slice of the same position). Used by analysis.
     resume_from_depth: Option<usize>,
-    // When `Some`, stop after finishing the first depth that ends past this elapsed-ms
-    // deadline. Only whole depths are ever committed, so results stay deterministic.
-    deadline_ms: Option<u128>,
     mut on_depth: Option<DepthCallback>,
 ) -> MultiPVResult {
     // Analysis start (streaming callback present): reset the per-thread node counters so the
     // aggregated NPS counts only this position's search, not retired helpers from the last one.
     #[cfg(feature = "multithreading")]
-    if on_depth.is_some() {
+    if on_depth.is_some() && searcher.thread_id == 0 {
         reset_search_nodes();
     }
-
-    // Initialize NNUE accumulator stack (stored on searcher).
-    #[cfg(feature = "nnue")]
-    searcher.nnue_init_root(game);
 
     // Get all legal moves upfront (exact: bypasses the stale slider cache)
     let mut moves = MoveList::new();
@@ -3023,6 +3142,13 @@ pub(crate) fn get_best_moves_multipv_impl(
         };
     }
 
+    set_conversion_wall_targets(game);
+    // The mid-iteration stop and the no-new-depth rule read total_time_ms, which only
+    // the single-PV loop set, so timed multi-PV ran to its hard maximum.
+    if searcher.hot.total_time_ms == 0.0 && searcher.hot.optimum_time_ms < u128::MAX {
+        searcher.hot.total_time_ms = searcher.hot.optimum_time_ms as f64;
+    }
+
     // A forced move makes a gameplay search pointless, so return a static eval.
     // Analysis mode (the streaming `on_depth` callback) still searches it to depth, so
     // the reported eval reflects look-ahead past the forced move.
@@ -3032,9 +3158,6 @@ pub(crate) fn get_best_moves_multipv_impl(
         return MultiPVResult {
             lines: vec![PVLine {
                 mv: single,
-                #[cfg(feature = "nnue")]
-                score: searcher.adjusted_eval(game, evaluate(game, searcher.nnue_at(0)), 0),
-                #[cfg(not(feature = "nnue"))]
                 score: searcher.adjusted_eval(game, evaluate(game), 0),
                 depth: 0,
                 pv: vec![single],
@@ -3066,6 +3189,10 @@ pub(crate) fn get_best_moves_multipv_impl(
         1
     };
 
+    // Gameplay time management, which declines depths it likely can't finish. Analysis
+    // (the streaming `on_depth` callback) spends its whole time, left to `check_time`.
+    let time_managed = searcher.hot.time_limit_ms != u128::MAX && on_depth.is_none();
+
     // Iterative deepening
     for base_depth in start_depth..=max_depth {
         let depth = if searcher.thread_id > 0 && searcher.thread_id % 2 == 1 {
@@ -3079,7 +3206,7 @@ pub(crate) fn get_best_moves_multipv_impl(
         searcher.hot.tot_best_move_changes /= 2.0;
 
         // Time check at start of each iteration - but always complete depth 1
-        if searcher.hot.min_depth_required == 0 && searcher.hot.time_limit_ms != u128::MAX {
+        if searcher.hot.min_depth_required == 0 && time_managed {
             let elapsed = searcher.hot.timer.elapsed_ms() as f64;
 
             // Hard stop at maximum time
@@ -3104,6 +3231,7 @@ pub(crate) fn get_best_moves_multipv_impl(
         }
 
         root_scores.clear();
+        searcher.hot.root_depth = depth;
 
         // Track the MultiPV alpha threshold
         let mut multipv_alpha = -INFINITY;
@@ -3140,11 +3268,6 @@ pub(crate) fn get_best_moves_multipv_impl(
                 searcher.hot.stopped = true;
                 break;
             }
-
-            // Incremental NNUE accumulator update for the child position (ply 1).
-            // Must be called BEFORE make_move.
-            #[cfg(feature = "nnue")]
-            searcher.nnue_push_move(game, 0, *m);
 
             let undo = game.make_move(m);
 
@@ -3337,8 +3460,7 @@ pub(crate) fn get_best_moves_multipv_impl(
                 #[cfg(not(feature = "multithreading"))]
                 let hashfull = searcher.tt.fill_permille();
 
-                // Thread-aggregated node count (Stockfish-style: total across all search
-                // threads). Publish this thread's latest count first, then sum every slot.
+                // Publish this thread's latest count first, then sum every slot.
                 #[cfg(feature = "multithreading")]
                 let report_nodes = {
                     publish_thread_nodes(searcher.thread_id, searcher.hot.nodes);
@@ -3374,7 +3496,6 @@ pub(crate) fn get_best_moves_multipv_impl(
         // A mate score is no stop condition, since a deeper search may find a shorter
         // mate. Only bail once every shown line mates within 3 plies, and only under
         // time management.
-        let time_managed = searcher.hot.time_limit_ms != u128::MAX;
         let mate_resolved = time_managed && !best_lines.is_empty() && {
             let worst = best_lines.last().unwrap().score;
             let best = best_lines[0].score;
@@ -3384,17 +3505,8 @@ pub(crate) fn get_best_moves_multipv_impl(
             break;
         }
 
-        // Analysis slicing: this depth completed, so if we're past the deadline stop here
-        // and let the caller resume at the next depth. Only whole depths are committed, so
-        // the result stays deterministic regardless of where the deadline lands.
-        if let Some(dl) = deadline_ms
-            && searcher.hot.timer.elapsed_ms() >= dl
-        {
-            break;
-        }
-
         // Soft time limit check - don't start next iteration if past 50%
-        if searcher.hot.time_limit_ms != u128::MAX {
+        if time_managed {
             let elapsed = searcher.hot.timer.elapsed_ms();
             if elapsed >= searcher.hot.time_limit_ms / 2 {
                 break;
@@ -3429,7 +3541,6 @@ pub fn negamax_node_count_for_depth(game: &mut GameState, depth: usize) -> u64 {
 
     let mut searcher = Searcher::new(u128::MAX);
     searcher.reset_for_iteration();
-    searcher.decay_history();
     searcher.tt.clear();
 
     // Generate and filter legal moves (exact: bypasses the stale slider cache)
@@ -3470,6 +3581,8 @@ fn negamax_root(
 
     searcher.pv_length[0] = 0;
     searcher.follow_pv[0] = true;
+    searcher.tt_pv_stack[0] = true;
+    searcher.hot.root_depth = depth;
 
     // Clear the grandchild cutoff/stat slots a ply-0 negamax node would reset;
     // negamax_root omits them, so slot 2 otherwise never clears across the search.
@@ -3503,9 +3616,6 @@ fn negamax_root(
     // negamax never runs at ply 0, so without this the ply-1 worsening and ply-2
     // improving tests compare against a zero root eval, i.e. against the score's sign.
     if !in_check {
-        #[cfg(feature = "nnue")]
-        let root_raw = evaluate(game, searcher.nnue_at(0));
-        #[cfg(not(feature = "nnue"))]
         let root_raw = evaluate(game);
         searcher.eval_stack[0] = searcher.adjusted_eval(game, root_raw, 0);
     } else {
@@ -3535,10 +3645,22 @@ fn negamax_root(
         // 1. Shared TT - threads benefit from each other's entries
         // 2. Slight timing differences - threads finish at different points
 
-        // Incremental NNUE accumulator update for the child position (ply 1).
-        // Must be called BEFORE make_move.
-        #[cfg(feature = "nnue")]
-        searcher.nnue_push_move(game, 0, *m);
+        // Slot 0's context, exactly as the interior loop fills its own ply. Without it
+        // every reply to a root move is ordered and reduced with no continuation history,
+        // the fail-low credit never reaches the root move, and qsearch sees no recapture.
+        let root_is_capture = game.is_en_passant(m)
+            || game
+                .board
+                .get_piece(m.to.x, m.to.y)
+                .is_some_and(|p| !p.piece_type().is_neutral_type());
+        let root_piece = m.piece.piece_type();
+        // Read before the move: making it changes the pawn hash the history is keyed by.
+        let root_hist = {
+            let idx = hash_move_dest(m);
+            let ph = (game.pawn_hash & PAWN_HISTORY_MASK) as usize;
+            searcher.history[hist_color(m.piece.color())][root_piece as usize][idx]
+                + searcher.pawn_hist(ph, root_piece as usize, idx)
+        };
 
         let undo = game.make_move(m);
 
@@ -3550,7 +3672,18 @@ fn negamax_root(
         searcher.prev_move_stack[0] = (prev_from_hash, prev_to_hash);
         searcher.root_played = Some(*m);
 
+        let move_history_backup = searcher.move_history[0].take();
+        let piece_history_backup = searcher.moved_piece_history[0];
+        let in_check_backup = searcher.in_check_history[0];
+        let capture_backup = searcher.capture_history_stack[0];
+
+        searcher.move_history[0] = Some(*m);
+        searcher.moved_piece_history[0] = root_piece as u8;
+        searcher.in_check_history[0] = in_check;
+        searcher.capture_history_stack[0] = root_is_capture;
+
         legal_moves += 1;
+        searcher.move_count_stack[0] = legal_moves.min(u16::MAX as usize) as u16;
 
         let score;
         if legal_moves == 1 {
@@ -3568,11 +3701,34 @@ fn negamax_root(
                 excluded_move: None,
             });
         } else {
+            // Late quiet root moves are reduced, never pruned: one that beats alpha is
+            // re-searched at full depth, so the root cannot lose its best move to it.
+            // 8x8 Chess and Pawn Horde have few root moves and their own tuned
+            // evaluators; they keep full depth.
+            let root_r = if depth >= 3
+                && !matches!(
+                    game.eval_kind,
+                    crate::evaluation::eval_kind::EvalKind::Chess
+                        | crate::evaluation::eval_kind::EvalKind::PawnHorde
+                )
+                && legal_moves >= 4
+                && !in_check
+                && !root_is_capture
+                && m.promotion.is_none()
+                && !game.is_in_check()
+            {
+                // History moves it as in the interior: a move that keeps producing
+                // cutoffs is reduced less, a known failure more.
+                (get_lmr(depth, legal_moves) - 1 - root_hist / 4096).clamp(0, depth as i32 - 2)
+                    as usize
+            } else {
+                0
+            };
             // PVS: Null window first, then re-search if it improves alpha
             let mut s = -negamax(&mut NegamaxContext {
                 searcher,
                 game,
-                depth: depth - 1,
+                depth: depth - 1 - root_r,
                 ply: 1,
                 alpha: -alpha - 1,
                 beta: -alpha,
@@ -3581,6 +3737,20 @@ fn negamax_root(
                 was_null_move: false,
                 excluded_move: None,
             });
+            if root_r > 0 && s > alpha {
+                s = -negamax(&mut NegamaxContext {
+                    searcher,
+                    game,
+                    depth: depth - 1,
+                    ply: 1,
+                    alpha: -alpha - 1,
+                    beta: -alpha,
+                    allow_null: true,
+                    node_type: NodeType::Cut,
+                    was_null_move: false,
+                    excluded_move: None,
+                });
+            }
             if s > alpha && s < beta {
                 s = -negamax(&mut NegamaxContext {
                     searcher,
@@ -3602,6 +3772,10 @@ fn negamax_root(
 
         // Restore previous-move stack entry for root after returning from child.
         searcher.prev_move_stack[0] = prev_entry_backup;
+        searcher.move_history[0] = move_history_backup;
+        searcher.moved_piece_history[0] = piece_history_backup;
+        searcher.in_check_history[0] = in_check_backup;
+        searcher.capture_history_stack[0] = capture_backup;
 
         if searcher.hot.stopped {
             return best_score;
@@ -3680,6 +3854,19 @@ fn negamax_root(
 }
 
 /// Main negamax with alpha-beta pruning
+/// Whether another allowed promotion piece moves everywhere `pt` does (queen over rook
+/// and bishop, amazon over every Q/R/B/N compound): same squares, so never worse.
+fn promotion_dominated(pt: PieceType, allowed: u32) -> bool {
+    use PieceType::*;
+    let has = |a: PieceType| allowed & (1 << a as u32) != 0;
+    match pt {
+        Rook | Bishop => has(Queen) || has(Amazon) || (pt == Rook && has(Chancellor)) || (pt == Bishop && has(Archbishop)),
+        Knight => has(Amazon) || has(Chancellor) || has(Archbishop),
+        Queen | Chancellor | Archbishop => has(Amazon),
+        _ => false,
+    }
+}
+
 fn negamax(ctx: &mut NegamaxContext) -> i32 {
     let searcher = &mut *ctx.searcher;
     let game = &mut *ctx.game;
@@ -3716,15 +3903,12 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
         } else {
             0
         };
-        #[cfg(feature = "nnue")]
-        return searcher.adjusted_eval(game, evaluate(game, searcher.nnue_at(ply)), prev_move_idx);
-        #[cfg(not(feature = "nnue"))]
         return searcher.adjusted_eval(game, evaluate(game), prev_move_idx);
     }
 
     // Check if we have an upcoming move that draws by repetition
-    if ply > 0 && alpha < VALUE_DRAW && game.upcoming_repetition(ply) {
-        let draw_val = value_draw(searcher.hot.nodes) + draw_contempt(searcher.contempt, ply);
+    let draw_val = value_draw(searcher.hot.nodes) + draw_contempt(searcher.contempt, ply);
+    if ply > 0 && alpha < draw_val && game.upcoming_repetition(ply) {
         if draw_val >= beta {
             return draw_val;
         }
@@ -3869,11 +4053,6 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
         let mut raw = tt_data_static_eval;
         if raw == INFINITY + 1 {
             raw = {
-                #[cfg(feature = "nnue")]
-                {
-                    evaluate(game, searcher.nnue_at(ply))
-                }
-                #[cfg(not(feature = "nnue"))]
                 {
                     evaluate(game)
                 }
@@ -3911,9 +4090,28 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
     }
     searcher.eval_stack[ply] = static_eval;
 
-    // Position improving heuristic: compare eval to 2 plies ago. In check there is no
-    // honest static eval to compare, so Stockfish calls it not-improving rather than
-    // improving; late-move pruning is not gated on check, so the choice is live.
+    // The opponent's quiet move earns history by how much it improved their eval
+    // (Stockfish's static-eval-difference bonus). Kept zero-mean and small: the tuned
+    // history thresholds in LMR and leaf pruning shift if the whole table drifts.
+    if !in_check
+        && depth >= 3
+        && ply > 0
+        && ctx.excluded_move.is_none()
+        && !searcher.in_check_history[ply - 1]
+        && !searcher.capture_history_stack[ply - 1]
+        && let Some(prev) = searcher.move_history[ply - 1]
+        && (searcher.moved_piece_history[ply - 1] as usize) < 32
+    {
+        let bonus = (-2 * (searcher.eval_stack[ply - 1] + static_eval)).clamp(-300, 300);
+        let pt = searcher.moved_piece_history[ply - 1] as usize;
+        let max_h = params::history_max_gravity();
+        let adj = bonus.clamp(-max_h, max_h);
+        let entry = &mut searcher.history[hist_color(prev.piece.color())][pt][hash_move_dest(&prev)];
+        *entry += adj - ((*entry * adj.abs()) >> 14);
+    }
+
+    // Compare eval to 2 plies ago. In check there is no honest static eval to
+    // compare against, and late-move pruning is not gated on check.
     let mut improving = if in_check {
         false
     } else if ply >= 2 {
@@ -3988,6 +4186,15 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
         // No repetition test: `is_draw` above already returned on one, and both it
         // and `is_repetition` report false inside a null subtree.
         if tt_data_depth_ok && bound_matches && node_type_matches && rule50_ok {
+            // An early quiet reply that a TT cutoff refutes was ordered too high
+            // (Stockfish's prior-move penalty on a TT cutoff).
+            if fails_high
+                && ply > 0
+                && !searcher.capture_history_stack[ply - 1]
+                && searcher.move_count_stack[ply - 1] <= 3
+            {
+                searcher.update_prior_cont_history(ply, -history_bonus_cap());
+            }
             return tt_s;
         }
 
@@ -4027,11 +4234,14 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
     if !in_check {
         // Pre-move pruning techniques
 
-        // Razoring: if eval is really low, drop to qsearch. Stockfish's margin is
-        // LINEAR in depth (482/ply, ~241 in our units) and uncapped, guarded against
-        // losing mates by seek_mate rather than by a depth cap. The quadratic margin
-        // here reached ~148 pawns by depth 8, so razoring was dead past depth 2.
-        if !is_pv && !searcher.hot.seek_mate && eval < alpha - razoring_quad() * depth as i32 {
+        // Razoring: if eval is really low, drop to qsearch. The margin is linear so
+        // it stays reachable at depth; seek_mate guards mate-finding instead of a cap.
+        // Not under exclusion: qsearch would return the parent's own TT bound on the singular move.
+        if !is_pv
+            && !searcher.hot.seek_mate
+            && excluded_move.is_none()
+            && eval < alpha - razoring_quad() * depth as i32
+        {
             return quiescence(searcher, game, ply, 0, alpha, beta, node_type);
         }
 
@@ -4071,18 +4281,15 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             if nmp_margin >= beta && game.has_non_pawn_material(game.turn) {
                 let saved_ep = game.en_passant;
                 let saved_plies_from_null = game.plies_from_null;
+                let saved_repetition = game.repetition;
                 // Install a null context so the child sees "no previous move"
                 // (disabling continuation-history lookups keyed on this ply)
                 // instead of a stale real move from an earlier sibling.
                 let ctx_backup = searcher.push_null_context(ply);
                 searcher.reduction_stack[ply] = 0;
+                searcher.stat_score_stack[ply] = 0;
 
                 game.make_null_move();
-
-                // Null-move NNUE: child accumulator at ply+1 equals parent at ply
-                // because a null move changes no piece positions.
-                #[cfg(feature = "nnue")]
-                searcher.nnue_push_null(ply);
 
                 let r = nmp_reduction_base() + depth / nmp_reduction_div();
                 let null_score = -negamax(&mut NegamaxContext {
@@ -4101,6 +4308,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 game.unmake_null_move();
                 game.en_passant = saved_ep;
                 game.plies_from_null = saved_plies_from_null;
+                game.repetition = saved_repetition;
 
                 searcher.pop_move_context(ply, ctx_backup);
 
@@ -4116,8 +4324,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     // search without the null move permission. This helps identify zugzwang
                     // positions or cases where NMP was too optimistic.
                     if depth >= 16 {
-                        // Verification re-search at current ply: nnue_stack[ply]
-                        // is already valid for this position (no move was made).
+                        // Verification re-search at the current ply (no move was made).
                         let verify_score = negamax(&mut NegamaxContext {
                             searcher,
                             game,
@@ -4144,12 +4351,10 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
         // Update improving flag based on static eval vs beta
         improving = improving || static_eval >= beta;
 
-        // Internal iterative reductions (IIR)
-        // Without TT move, reduce depth to find one faster. Nodes still on the
-        // previous iteration's PV are exempt: reducing the line the engine
-        // currently believes in is what it can least afford to get wrong.
+        // Internal iterative reductions (IIR): without a TT move, reduce depth to find one faster.
+        // An all-node is expected to fail low anyway, so it takes the deeper cut.
         if depth >= iir_min_depth() && tt_move.is_none() {
-            depth -= 2;
+            depth -= if all_node && depth >= 4 { 3 } else { 2 };
         }
     }
 
@@ -4164,9 +4369,11 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
         && !is_decisive(beta)
         && tt_value.is_none_or(|v| v >= prob_cut_beta)
     {
+        // Chess measured best one ply shallower than the other variants.
+        let depth_sub = probcut_depth_sub() as i32
+            + (game.eval_kind == crate::evaluation::eval_kind::EvalKind::Chess) as i32;
         let mut prob_cut_depth =
-            (depth as i32 - probcut_depth_sub() as i32 - (static_eval - beta) / probcut_divisor())
-                .max(0) as usize;
+            (depth as i32 - depth_sub - (static_eval - beta) / probcut_divisor()).max(0) as usize;
         if prob_cut_depth > depth {
             prob_cut_depth = depth;
         }
@@ -4184,14 +4391,6 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             }
             // Fast legality check (skips is_move_illegal for non-pinned pieces)
             let fast_legal = game.is_legal_fast(&m, in_check);
-            if let Ok(false) = fast_legal {
-                continue;
-            }
-
-            // Incremental NNUE accumulator update for the child position.
-            // Must be called BEFORE make_move.
-            #[cfg(feature = "nnue")]
-            searcher.nnue_push_move(game, ply, m);
 
             // Install this node's context for the child search, matching the main
             // loop. Without it a sibling's stale context corrupts continuation and
@@ -4208,7 +4407,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
 
             let undo = game.make_move(&m);
 
-            if fast_legal.is_err() && game.is_move_illegal() {
+            if !fast_legal && game.is_move_illegal() {
                 game.undo_move(&m, undo);
                 searcher.pop_move_context(ply, pc_ctx);
                 continue;
@@ -4297,6 +4496,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
     // a set of null-window bounds, and storing it evicts a move a real search learned.
     // Kept separate because `best_move` also feeds the futility margin and tt history.
     let mut tt_best_move: Option<Move> = None;
+    // Four atomic loads, constant for the node: both pruning gates read it per move.
+    let world_size = crate::moves::get_world_size();
     let mut legal_moves = 0;
     let mut quiets_searched: MoveList = MoveList::new();
 
@@ -4306,7 +4507,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
     {
         if tt_hit_node
             && (tt_data_bound == TTFlag::LowerBound || tt_data_bound == TTFlag::Exact)
-            && tt_data_depth as usize >= depth.saturating_sub(3)
+            && tt_data_depth as usize >= depth.saturating_sub(4)
             && let Some(tt_v) = tt_value
             && !is_decisive(tt_v)
         {
@@ -4320,6 +4521,14 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
 
     // New depth for child nodes
     let new_depth = depth.saturating_sub(1);
+
+    // Allowed promotion pieces as a bitmask (the generator defaults to Q, R, B, N).
+    let promo_mask: u32 = match game.game_rules.promotion_types.as_deref() {
+        Some(ts) => ts.iter().fold(0, |acc, &t| acc | 1 << t as u32),
+        None => [PieceType::Queen, PieceType::Rook, PieceType::Bishop, PieceType::Knight]
+            .iter()
+            .fold(0, |acc, &t| acc | 1 << t as u32),
+    };
 
     // Main move loop - iterate through staged moves
     while let Some(m) = movegen.next(game, searcher) {
@@ -4343,9 +4552,14 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             captured_piece.map(|p| p.piece_type())
         };
         let is_promotion = m.promotion.is_some();
+        if let Some(pt) = m.promotion
+            && promotion_dominated(pt, promo_mask)
+        {
+            continue;
+        }
         let p_type = m.piece.piece_type();
         let is_royal_capture_win = captured_type.is_some_and(|pt| pt.is_royal())
-            && win_condition_for_side(game, game.turn) == WinCondition::RoyalCapture;
+            && royal_capture_decides(game, game.turn.opponent());
 
         // Obstocean breakout: pawn-takes-neutral-obstacle opens the variant's key line
         // but scores as quiet since the victim is neutral. Treated as tactical for
@@ -4355,11 +4569,12 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             && captured_type == Some(PieceType::Obstacle);
 
         // Check if this move gives check to enemy king (O(1) for knights/pawns)
-        let gives_check = StagedMoveGen::move_gives_check_fast(game, &m);
+        let gives_check = movegen
+            .cached_gives_check()
+            .unwrap_or_else(|| StagedMoveGen::move_gives_check_fast(game, &m));
 
-        // In-move pruning at shallow depths (not in PV, have material, not losing)
-        // Stockfish prunes at a PV node that has LEFT the previous iteration's PV
-        // (!followPV || !PvNode); this engine never pruned at a PV node at all.
+        // In-move pruning at shallow depths. A PV node is prunable once it has left
+        // the previous iteration's PV; only the believed line is protected.
         if (!is_pv || !searcher.follow_pv[ply])
             && game.has_non_pawn_material(game.turn)
             && !is_loss(best_score)
@@ -4370,7 +4585,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             // the latter lets too many quiets through. Excludes Obstocean: its main
             // tactic IS a quiet pawn-takes-obstacle, so pruning sooner discards it.
             let mut lmp_count = (lmp_base() + depth * depth * lmp_depth_mult()) / improving_div;
-            if crate::moves::get_world_size() <= LMP_BOUNDED_WORLD
+            if world_size <= LMP_BOUNDED_WORLD
                 && game.eval_kind != crate::evaluation::eval_kind::EvalKind::Obstocean
             {
                 lmp_count = (lmp_count * LMP_BOUNDED_NUM / LMP_BOUNDED_DEN).max(1);
@@ -4381,11 +4596,19 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 movegen.skip_quiet_moves();
             }
 
-            // LMR depth estimate for pruning decisions
-            let lmr_depth = new_depth as i32;
+            // Futility and SEE margins judge the depth the move would actually be searched at.
+            let lmr_depth = (new_depth as i32 - get_lmr(depth, legal_moves + 1)).max(0);
 
-            if is_capture || gives_check {
+            // A quiet promotion is tactical: quiet futility prices it at the pre-move eval,
+            // a full piece short, so only SEE may prune it.
+            if is_capture || gives_check || is_promotion {
                 // Capture/check pruning
+                if !is_capture
+                    && !gives_check
+                    && !see_ge(game, &m, -see_capture_linear() * depth as i32)
+                {
+                    continue;
+                }
                 if let Some(cap_type) = captured_type.filter(|_| !is_royal_capture_win) {
                     let capt_hist = searcher.capture_history[p_type as usize][cap_type as usize];
 
@@ -4401,9 +4624,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     }
                 }
             } else {
-                // Quiet move pruning. Ordering and the LMR reduction both pool these
-                // four tables; pruning read main history alone, so a move that follows
-                // well after the previous plies was pruned like a stranger.
+                // Quiet move pruning. Pools the same four tables ordering and the LMR
+                // reduction use, so a move that follows well is not pruned as a stranger.
                 let hist_idx = hash_move_dest(&m);
                 let main_hist =
                     searcher.history[hist_color(m.piece.color())][p_type as usize][hist_idx];
@@ -4413,9 +4635,11 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 {
                     let cf = hash_coord_16(m.from.x, m.from.y);
                     let ct = hash_coord_16(m.to.x, m.to.y);
+                    let side = 3 * hist_color(m.piece.color());
                     for &(ci, pc, pi, pp, pt_h) in movegen.cont_history_indices.iter() {
                         if ci < 2 {
-                            cont_h += searcher.cont_history[ci][pc][pi][pp][pt_h][cf][ct] as i32;
+                            cont_h +=
+                                searcher.cont_history[ci + side][pc][pi][pp][pt_h][cf][ct] as i32;
                         }
                     }
                 }
@@ -4429,7 +4653,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 // Bounded boards only: with an edge to work against, a far quiet
                 // slider aim is usually junk; on an open plane it is manoeuvring.
                 if !is_obstocean_breakout
-                    && crate::moves::get_world_size() <= FAR_SLIDER_PRUNE_MAX_WORLD
+                    && world_size <= FAR_SLIDER_PRUNE_MAX_WORLD
                     && depth <= FAR_SLIDER_PRUNE_MAX_DEPTH
                     && history < FAR_SLIDER_PRUNE_HIST
                     && (crate::attacks::is_ortho_slider(p_type)
@@ -4464,12 +4688,9 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             }
         }
 
-        // Check legality BEFORE make_move (Pin Detection)
-        // returns Ok(true) if legal, Ok(false) if illegal, Err if unsure
+        // Check legality BEFORE make_move (Pin Detection).
+        // True proves the move legal; false only means "unproven", never "illegal".
         let fast_legal = game.is_legal_fast(&m, in_check);
-        if let Ok(false) = fast_legal {
-            continue; // Definitely illegal (pinned piece moving off ray)
-        }
 
         // Prefetch the child's TT entry before making the move, so the probe in
         // the recursive call is already warm.
@@ -4487,7 +4708,9 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             }
             // The child always clears the parent's en-passant square, so without
             // this the prefetch walks to an unrelated bucket on those nodes.
-            if let Some(ep) = game.en_passant {
+            if let Some(ep) = game.en_passant
+                && ep.hashed
+            {
                 child_hash ^= crate::search::zobrist::en_passant_key(ep.square.x, ep.square.y);
             }
             #[cfg(feature = "multithreading")]
@@ -4496,12 +4719,6 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             }
             searcher.tt.prefetch_entry(child_hash);
         }
-
-        // Incremental NNUE accumulator update for the child position (ply+1).
-        // Must be called BEFORE make_move. If singular extension below runs and
-        // clobbers nnue_stack[ply+1], we re-push after the singular verification.
-        #[cfg(feature = "nnue")]
-        searcher.nnue_push_move(game, ply, m);
 
         // Pawn history is keyed on the position where the move is chosen (the
         // parent). Capture it before make_move so the LMR/HLP reductions read
@@ -4512,7 +4729,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
 
         // Check if move is illegal (leaves our king in check)
         // Only check if fast check was inconclusive (Err)
-        if fast_legal.is_err() && game.is_move_illegal() {
+        if !fast_legal && game.is_move_illegal() {
             game.undo_move(&m, undo);
             continue;
         }
@@ -4541,6 +4758,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
         searcher.capture_history_stack[ply] = is_capture;
 
         legal_moves += 1;
+        searcher.move_count_stack[ply] = legal_moves.min(u16::MAX as usize) as u16;
 
         // Calculate per-move extension (can be negative for negative extensions).
         let mut extension: i32 = 0;
@@ -4558,7 +4776,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
         }) {
             // Singular extension margin with TT Move History adjustment.
             let tt_history_adj = searcher.tt_move_history / 150;
-            let singular_beta = tt_s_base - (depth as i32) * 3 + tt_history_adj;
+            let singular_beta = tt_s_base - (depth as i32) * 4 + tt_history_adj;
 
             // Undo the TT move so we can search from the current position
             game.undo_move(&m, undo);
@@ -4570,14 +4788,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             searcher.in_check_history[ply] = in_check_backup;
             searcher.capture_history_stack[ply] = capture_backup;
 
-            // Singular recursion clobbers stack[ply+1] while exploring other moves, so
-            // stash the child accumulator computed for `m` and restore it afterwards.
-            #[cfg(feature = "nnue")]
-            searcher.nnue_save_scratch(ply + 1);
-
-            // Recursive search excluding the TT move (Stockfish excludedMove pattern)
-            // This searches the full move tree minus the TT move at reduced depth,
-            // providing accurate singularity verification.
+            // Search every move but the TT move at reduced depth: if none comes near
+            // the TT score, the TT move is singular.
             let se_value = negamax(&mut NegamaxContext {
                 searcher,
                 game,
@@ -4591,21 +4803,19 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 } else {
                     NodeType::All
                 },
-                was_null_move: false,
+                was_null_move: ctx.was_null_move,
                 excluded_move: Some(m),
             });
 
-            // Restore the child accumulator for `m`
-            #[cfg(feature = "nnue")]
-            searcher.nnue_restore_scratch(ply + 1);
-
-            // Re-make the TT move and restore state for child search
+            // Re-make the TT move and restore state for child search; the exclusion
+            // search ran at this ply and left its own move count in the slot.
             undo = game.make_move(&m);
             searcher.prev_move_stack[ply] = (from_hash, to_hash);
             searcher.move_history[ply] = Some(m);
             searcher.moved_piece_history[ply] = p_type as u8;
             searcher.in_check_history[ply] = in_check;
             searcher.capture_history_stack[ply] = is_capture;
+            searcher.move_count_stack[ply] = legal_moves.min(u16::MAX as usize) as u16;
 
             if searcher.hot.stopped {
                 game.undo_move(&m, undo);
@@ -4619,10 +4829,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
 
             if se_value < singular_beta {
                 // TT move is singular - calculate extension level
-                let pv_bonus = if is_pv { (depth as i32) * 2 } else { 0 };
-                let double_margin = (depth as i32) * 2 - (tt_capture as i32 * 5) + pv_bonus;
-                let triple_margin =
-                    (depth as i32) * 4 - (tt_capture as i32 * 10) + pv_bonus * 2;
+                let double_margin = (depth as i32) * 2 - (tt_capture as i32 * 5);
+                let triple_margin = (depth as i32) * 4 - (tt_capture as i32 * 10);
 
                 extension = 1;
                 if se_value < singular_beta - double_margin {
@@ -4634,7 +4842,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
 
                 // Depth++ after detecting singularity
                 depth += 1;
-            } else if se_value >= beta && !is_pv && !is_decisive(se_value) {
+            } else if se_value >= beta && !is_decisive(se_value) {
                 // Multi-cut: alternatives also beat beta, prune the whole subtree
                 let penalty = (-400 - 100 * depth as i32).max(-4000);
                 searcher.tt_move_history +=
@@ -4652,15 +4860,22 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 extension = -3;
             } else if cut_node {
                 // On cut nodes, if TT move isn't assumed to fail high, reduce it
-                extension = -2;
+                extension = -1;
             }
         }
 
-        // A check right at the horizon would otherwise be resolved by the qsearch
+        // A check near the horizon would otherwise be resolved by the qsearch
         // boundary instead of a real reply; give it one more ply. Gated on !in_check
         // so a forced sequence of replying checks can't chain extensions forever.
-        if extension == 0 && depth <= 1 && gives_check && !in_check {
+        if extension == 0 && depth <= 3 && gives_check && !in_check {
             extension = 1;
+        }
+
+        // Past twice the root depth, extensions have already stacked up a long forced
+        // line; stop growing it so one branch cannot eat the whole iteration.
+        let root_depth = searcher.hot.root_depth;
+        if extension > 0 && root_depth > 0 && ply >= 2 * root_depth {
+            extension = 0;
         }
 
         // The child reads this for evaluation smoothing. Set for every move, not only
@@ -4704,7 +4919,6 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 && legal_moves >= lmr_min_moves()
                 && !in_check
                 && !is_capture
-                && !(gives_check && (p_type == PieceType::Queen || p_type == PieceType::Amazon))
             {
                 reduction = get_lmr(depth, legal_moves);
 
@@ -4713,6 +4927,12 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     reduction += 1;
                 }
 
+
+                // A capturing TT move means these quiets are competing against a
+                // tactical refutation, so they earn more reduction.
+                if tt_capture {
+                    reduction += 1;
+                }
 
                 // A cut node is expected to fail high on an early move, so the moves
                 // after it are far likelier to be refutations than real candidates.
@@ -4726,17 +4946,17 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 let hist_score =
                     searcher.history[hist_color(m.piece.color())][p_type as usize][hist_idx];
                 let pawn_score = searcher.pawn_hist(ph_idx, p_type as usize, hist_idx);
-                // Continuation history already steers ordering; the reduction
-                // stat was blind to it, so a move that follows well after the
-                // previous two plies was reduced like a stranger.
+                // Continuation history steers ordering, so the reduction stat reads it
+                // too: a move following well after the previous two plies reduces less.
                 let mut cont_score = 0i32;
                 {
                     let cf = hash_coord_16(m.from.x, m.from.y);
                     let ct = hash_coord_16(m.to.x, m.to.y);
+                    let side = 3 * hist_color(m.piece.color());
                     for &(ci, pc, pi, pp, pt_h) in movegen.cont_history_indices.iter() {
                         if ci < 2 {
                             cont_score +=
-                                searcher.cont_history[ci][pc][pi][pp][pt_h][cf][ct] as i32;
+                                searcher.cont_history[ci + side][pc][pi][pp][pt_h][cf][ct] as i32;
                         }
                     }
                 }
@@ -4767,6 +4987,12 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
 
                 // Search the variant's defining line-opening tactic a ply deeper.
                 if is_obstocean_breakout {
+                    reduction -= 1;
+                }
+
+                // Lost games turn on check sequences against the king 3x as often as calm
+                // positions, so a checking move is searched a ply deeper.
+                if gives_check {
                     reduction -= 1;
                 }
 
@@ -4802,6 +5028,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     // If depth after reductions would drop to quiescence or below
                     // and history is really bad, prune this move entirely.
                     if new_depth <= 0 && value < hlp_history_leaf() {
+                        // Never searched, so it earns no malus at the next cutoff.
+                        quiets_searched.pop();
                         game.undo_move(&m, undo);
                         // Restore all five node-context fields before continuing, or
                         // in_check_history and capture_history_stack go stale.
@@ -4830,7 +5058,10 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 NodeType::Cut
             };
 
-            // Store reduction for hindsight depth adjustment in child nodes
+            // Store reduction for hindsight depth adjustment in child nodes; history
+            // leaf pruning's extra ply counts as reduction too.
+            let base_depth = (depth as i32) - 1 + extension;
+            let reduction = reduction.max(base_depth - new_depth);
             searcher.reduction_stack[ply] = reduction;
 
             // The first move of the node already took the full window in the
@@ -4856,7 +5087,6 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 // LMR deeper/shallower re-search depth adjustment
                 // If reduced search returned good value, search deeper
                 // If it returned bad value, search shallower
-                let base_depth = (depth as i32) - 1 + extension;
                 let do_deeper_search =
                     (search_depth as i32) < base_depth && s > (best_score + 43 + 2 * base_depth);
                 let do_shallower_search = s < best_score + 9;
@@ -4911,7 +5141,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                                 let prev_cap =
                                     searcher.capture_history_stack[ply - plies_ago] as usize;
 
-                                let entry = &mut searcher.cont_history[idx][prev_cap][prev_ic]
+                                let slot = idx + 3 * hist_color(m.piece.color());
+                                let entry = &mut searcher.cont_history[slot][prev_cap][prev_ic]
                                     [prev_piece][prev_to_hash][cf_hash][ct_hash];
 
                                 let adj = (lmr_bonus * CONT_WEIGHTS[idx]) / 1024;
@@ -5018,12 +5249,14 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     searcher.killers[ply][0] = Some(m);
                 }
 
-                // Countermove heuristic
-                if ply > 0 {
+                // Countermove heuristic. The destination is truncated to i32 here and
+                // at the read site alike, so a false match needs a 2^32 coordinate gap,
+                // which the far-escape shell (+/-4063) keeps out of reach.
+                if ply > 0 && searcher.plies_from_null[ply] != 1 {
                     let (prev_from_hash, prev_to_hash) = searcher.prev_move_stack[ply - 1];
                     if prev_from_hash < 256 && prev_to_hash < 256 {
-                        searcher.countermoves[prev_from_hash][prev_to_hash] =
-                            (m.piece.piece_type() as u8, m.to.x as i32, m.to.y as i32);
+                        searcher.countermoves[hist_color(m.piece.color())][prev_from_hash]
+                            [prev_to_hash] = (m.piece.piece_type() as u8, m.to.x as i32, m.to.y as i32);
                     }
                 }
 
@@ -5051,7 +5284,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                                 let q_to_hash = hash_coord_16(quiet.to.x, quiet.to.y);
                                 let is_best = quiet.from == m.from && quiet.to == m.to;
 
-                                let entry = &mut searcher.cont_history[idx][prev_cap][prev_ic]
+                                let slot = idx + 3 * hist_color(quiet.piece.color());
+                                let entry = &mut searcher.cont_history[slot][prev_cap][prev_ic]
                                     [prev_piece][prev_to_hash][q_from_hash][q_to_hash];
 
                                 let raw_adj = bonus.min(history_bonus_cap());
@@ -5084,13 +5318,16 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
 
     // Checkmate, stalemate, or loss by capture-based variants
     if legal_moves == 0 {
-        let checkmate = in_check && game.must_escape_check();
-        let no_pieces = !game.has_pieces(game.turn);
-        if checkmate || no_pieces {
-            best_score = -MATE_VALUE + ply as i32;
+        // An exclusion search with no moves left only proves the excluded move was the
+        // only legal one. Scoring that 0 reads as a draw: a negative beta turns it into
+        // a multi-cut for the whole node, and 0 < singular_beta into extreme singularity.
+        best_score = if excluded_move.is_some() {
+            alpha
+        } else if (in_check && game.must_escape_check()) || !game.has_pieces(game.turn) {
+            -MATE_VALUE + ply as i32
         } else {
-            best_score = 0; // Stalemate
-        }
+            0 // Stalemate
+        };
         best_move = None;
         tt_best_move = None;
     }
@@ -5134,7 +5371,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 depth: tt_store_depth,
                 flag: tt_data_bound,
                 score: best_score,
-                static_eval: raw_eval,
+                // In check, raw_eval is borrowed from two plies up, not this position's.
+                static_eval: if in_check { INFINITY + 1 } else { raw_eval },
                 is_pv: tt_pv,
                 best_move: tt_best_move,
                 ply,
@@ -5178,8 +5416,10 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 let offsets = [1usize, 2, 4];
                 const CONT_WEIGHTS: [i32; 3] = [1024, 712, 410];
 
+                // The opponent moved at ply - 1, so its in-check state gates the depth.
+                let prior_in_check = searcher.in_check_history[ply - 1];
                 for (idx, &plies_ago) in offsets.iter().enumerate() {
-                    if in_check && plies_ago > 2 {
+                    if prior_in_check && plies_ago > 2 {
                         break;
                     }
                     // Current node: ply. Opponent move: ply - 1.
@@ -5197,7 +5437,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                             let adj = raw_adj.clamp(-max_h, max_h);
                             let weighted_adj = (adj * CONT_WEIGHTS[idx]) / 1024;
 
-                            let entry = &mut searcher.cont_history[idx][anc_cap][anc_ic][anc_piece]
+                            let slot = idx + 3 * hist_color(prev_move.piece.color());
+                            let entry = &mut searcher.cont_history[slot][anc_cap][anc_ic][anc_piece]
                                 [anc_to][opponent_from_hash][opponent_to_hash];
                             let cur = *entry as i32;
                             *entry =
@@ -5277,15 +5518,12 @@ fn quiescence(
 ) -> i32 {
     let is_pv = node_type == NodeType::PV;
     if ply >= MAX_PLY - 1 {
-        #[cfg(feature = "nnue")]
-        return evaluate(game, searcher.nnue_at(ply));
-        #[cfg(not(feature = "nnue"))]
         return evaluate(game);
     }
 
     // Check if we have an upcoming move that draws by repetition
-    if alpha < VALUE_DRAW && game.upcoming_repetition(ply) {
-        let draw_val = value_draw(searcher.hot.nodes) + draw_contempt(searcher.contempt, ply);
+    let draw_val = value_draw(searcher.hot.nodes) + draw_contempt(searcher.contempt, ply);
+    if alpha < draw_val && game.upcoming_repetition(ply) {
         if draw_val >= beta {
             return draw_val;
         }
@@ -5361,9 +5599,10 @@ fn quiescence(
             (false, None, INFINITY + 1, TTFlag::None, false, None)
         };
 
-    // TT Cutoff for QSearch
+    // TT Cutoff for QSearch, with negamax's guard near the move-rule limit
     if !is_pv
         && tt_hit
+        && game.halfmove_clock < (searcher.move_rule_limit as u32).saturating_sub(4)
         && let Some(tt_s) = tt_value
     {
         let fails_high = tt_s >= beta;
@@ -5383,7 +5622,7 @@ fn quiescence(
     // side can stand-pat while its royal is captured on the next ply.
     let must_escape = in_check && game.must_escape_check();
     let must_resolve_royal_capture =
-        in_check && opponent_win_condition_for_side(game, game.turn) == WinCondition::RoyalCapture;
+        in_check && royal_capture_decides(game, game.turn);
     let tactical_check = must_escape || must_resolve_royal_capture;
 
     // Step 4. Static evaluation
@@ -5405,11 +5644,6 @@ fn quiescence(
         if tt_hit {
             unadjusted_static_eval = tt_data_static_eval;
             if unadjusted_static_eval == INFINITY + 1 {
-                #[cfg(feature = "nnue")]
-                {
-                    unadjusted_static_eval = evaluate(game, searcher.nnue_at(ply));
-                }
-                #[cfg(not(feature = "nnue"))]
                 {
                     unadjusted_static_eval = evaluate(game);
                 }
@@ -5431,11 +5665,6 @@ fn quiescence(
                 }
             }
         } else {
-            #[cfg(feature = "nnue")]
-            {
-                unadjusted_static_eval = evaluate(game, searcher.nnue_at(ply));
-            }
-            #[cfg(not(feature = "nnue"))]
             {
                 unadjusted_static_eval = evaluate(game);
             }
@@ -5502,14 +5731,35 @@ fn quiescence(
         return best_value; // stand-pat
     }
 
-    let mut tactical_moves: MoveList = MoveList::new();
-    std::mem::swap(&mut tactical_moves, &mut searcher.move_buffers[ply]);
+    let mut tactical_moves = searcher.move_buffers[ply].take().unwrap_or_default();
     tactical_moves.clear();
 
     if tactical_check {
         // In check: checkmate variants require evasions; RoyalCapture qsearch
         // uses the same narrow evasion set to resolve whether capture is forced.
         game.get_evasion_moves_into(&mut tactical_moves);
+        // Where check is not binding, taking a deciding enemy royal elsewhere wins
+        // outright, and the evasion set never contains it.
+        if !must_escape && royal_capture_decides(game, game.turn.opponent()) {
+            let pinned = rustc_hash::FxHashMap::default();
+            let ctx = MoveGenContext {
+                pinned: &pinned,
+                special_rights: &game.special_rights,
+                en_passant: &game.en_passant,
+                game_rules: &game.game_rules,
+                indices: &game.spatial_indices,
+                enemy_king_pos: game.enemy_king_pos(),
+            };
+            let mut captures = MoveList::new();
+            get_quiescence_captures(&game.board, game.turn, &ctx, &mut captures);
+            for m in captures.iter() {
+                if game.board.get_piece(m.to.x, m.to.y).is_some_and(|p| p.piece_type().is_royal())
+                    && !tactical_moves.iter().any(|e| e.from == m.from && e.to == m.to)
+                {
+                    tactical_moves.push(*m);
+                }
+            }
+        }
     } else {
         // Normal quiescence: generate captures only
         // Only quiet slider generation consults the pin map; every capture
@@ -5563,9 +5813,19 @@ fn quiescence(
         None
     };
 
-    for m in &tactical_moves {
+    // Underpromotions almost never matter at the horizon, and a variant with five
+    // promotion pieces multiplies every promoting move by five: try only the best.
+    let best_promo = match game.game_rules.promotion_types.as_deref() {
+        Some(ts) => ts.iter().copied().max_by_key(|&t| crate::evaluation::get_piece_value_base(t)),
+        None => Some(PieceType::Queen), // the generator's default set
+    };
+
+    for m in tactical_moves.iter() {
         // Compute essential move properties
         let captured = game.board.get_piece(m.to.x, m.to.y);
+        if !in_check && m.promotion.is_some() && best_promo.is_some() && m.promotion != best_promo {
+            continue;
+        }
         let is_capture =
             game.is_en_passant(m) || captured.is_some_and(|p| !p.piece_type().is_neutral_type());
 
@@ -5574,7 +5834,7 @@ fn quiescence(
         let is_recapture = prev_sq.is_some_and(|sq| sq == m.to);
 
         let captures_royal_for_win = captured.is_some_and(|p| p.piece_type().is_royal())
-            && win_condition_for_side(game, game.turn) == WinCondition::RoyalCapture;
+            && royal_capture_decides(game, game.turn.opponent());
 
         // A pawn capturing a neutral obstacle is Obstocean's defining line-opening
         // tactic, yet it scores as quiet. Exempt it from the quiet cutoff; the SEE and
@@ -5583,10 +5843,21 @@ fn quiescence(
             && m.piece.piece_type() == PieceType::Pawn
             && captured.is_some_and(|p| p.piece_type() == PieceType::Obstacle);
 
+        // Taking any other obstacle is a quiet move: without this, checking obstacle
+        // captures chained through all 16 qsearch plies (650k nodes at depth 1).
+        let is_obstacle_take = !is_capture
+            && !is_obstocean_breakout
+            && !is_recapture
+            && game.eval_kind == crate::evaluation::eval_kind::EvalKind::Obstocean
+            && captured.is_some_and(|p| p.piece_type().is_neutral_type());
+        if is_obstacle_take && !in_check && qs_ply > 0 {
+            continue;
+        }
+
         // move_gives_check_fast is only needed to keep quiet checks; evaluate it
         // last so it is skipped for captures/recaptures and the first few moves.
         if !in_check
-            && legal_moves > 2
+            && (legal_moves > 2 || is_obstacle_take)
             && !is_capture
             && !is_recapture
             && !is_obstocean_breakout
@@ -5595,20 +5866,37 @@ fn quiescence(
             continue;
         }
 
-        if !captures_royal_for_win && !in_check && !is_loss(best_value) && !is_recapture {
-            let see_gain = static_exchange_eval(game, m);
-            if see_gain < 0 {
-                continue;
-            }
-            if best_value + see_gain + delta_margin < alpha {
+        // Evasions, as in Stockfish: once one has shown we are not mated, only captures
+        // that do not lose material are still searched. Obstocean keeps every evasion.
+        // A check that needn't be answered searched ordinary captures, so it gets the
+        // ordinary floors below instead.
+        if tactical_check
+            && game.eval_kind != crate::evaluation::eval_kind::EvalKind::Obstocean
+            && !captures_royal_for_win
+            && !is_loss(best_value)
+            && (!is_capture || !see_ge(game, m, -74))
+        {
+            continue;
+        }
+
+        if !captures_royal_for_win && !tactical_check && !is_loss(best_value) && !is_recapture {
+            // A slightly losing capture can still be the point of a combination, so
+            // the floor sits below zero rather than at it. Both tests are
+            // thresholds, so one see_ge early-outs where a full swap would not.
+            // Deep in qsearch an even trade only lengthens the chain: a melee of heavy
+            // pieces trades down 16 plies wide. From there on a capture must win.
+            let floor = if qs_ply >= QS_EVEN_TRADE_PLY { 1 } else { -37 };
+            let need = floor.max(
+                alpha
+                    .saturating_sub(best_value)
+                    .saturating_sub(delta_margin),
+            );
+            if !see_ge(game, m, need) {
                 continue;
             }
         }
 
         let fast_legal = game.is_legal_fast(m, in_check);
-        if let Ok(false) = fast_legal {
-            continue;
-        }
 
         // Quiescence probes the table at every node and is about half of them, so
         // it wants the same prefetch the main loop already issues.
@@ -5626,7 +5914,9 @@ fn quiescence(
             if let Some(cap) = captured {
                 child_hash ^= piece_key(cap.piece_type(), cap.color(), m.to.x, m.to.y);
             }
-            if let Some(ep) = game.en_passant {
+            if let Some(ep) = game.en_passant
+                && ep.hashed
+            {
                 child_hash ^= crate::search::zobrist::en_passant_key(ep.square.x, ep.square.y);
             }
             #[cfg(feature = "multithreading")]
@@ -5636,14 +5926,9 @@ fn quiescence(
             searcher.tt.prefetch_entry(child_hash);
         }
 
-        // Incremental NNUE accumulator update for the child position (ply+1).
-        // Must be called BEFORE make_move.
-        #[cfg(feature = "nnue")]
-        searcher.nnue_push_move(game, ply, *m);
-
         let undo = game.make_move(m);
 
-        if fast_legal.is_err() && game.is_move_illegal() {
+        if !fast_legal && game.is_move_illegal() {
             game.undo_move(m, undo);
             continue;
         }
@@ -5669,7 +5954,7 @@ fn quiescence(
         searcher.pop_move_context(ply, qs_ctx);
 
         if searcher.hot.stopped {
-            std::mem::swap(&mut tactical_moves, &mut searcher.move_buffers[ply]);
+            searcher.move_buffers[ply] = Some(tactical_moves);
             return best_value;
         }
 
@@ -5691,12 +5976,12 @@ fn quiescence(
         let checkmate = tactical_check;
         let no_pieces = !game.has_pieces(game.turn);
         if checkmate || no_pieces {
-            std::mem::swap(&mut tactical_moves, &mut searcher.move_buffers[ply]);
+            searcher.move_buffers[ply] = Some(tactical_moves);
             return -MATE_VALUE + ply as i32;
         }
     }
 
-    std::mem::swap(&mut tactical_moves, &mut searcher.move_buffers[ply]);
+    searcher.move_buffers[ply] = Some(tactical_moves);
 
     if !is_decisive(best_value) && best_value > beta {
         best_value = (best_value + beta) / 2;

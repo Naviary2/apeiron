@@ -115,7 +115,7 @@ impl TTEntry {
             } else {
                 Some(PieceType::from_u8(pr))
             },
-            partner_coord: None,
+            partner_x: crate::moves::NO_PARTNER,
         })
     }
 
@@ -186,7 +186,6 @@ pub struct LocalTranspositionTable {
     _mem_anchor: Vec<TTBucket>,
 }
 
-unsafe impl Sync for LocalTranspositionTable {}
 unsafe impl Send for LocalTranspositionTable {}
 
 /// Allocates `cap` zeroed buckets without a memset: TTBucket's all-zero bytes ARE its empty
@@ -508,7 +507,7 @@ mod tests {
             to: Coordinate::new(4, 4),
             piece: Piece::new(PieceType::Pawn, PlayerColor::White),
             promotion: None,
-            partner_coord: None,
+            partner_x: crate::moves::NO_PARTNER,
         };
         tt.store(&TTStoreParams {
             hash,
@@ -545,7 +544,7 @@ mod tests {
             to: Coordinate::new(-4000, 4000),
             piece: Piece::new(PieceType::Rook, PlayerColor::Black),
             promotion: None,
-            partner_coord: None,
+            partner_x: crate::moves::NO_PARTNER,
         };
         assert!(e.encode_move(&m, 0));
         let decoded = e.best_move(0).unwrap();

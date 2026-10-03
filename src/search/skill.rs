@@ -5,9 +5,8 @@ use super::*;
 pub const MAX_SITE_SKILL: u32 = 8; // Current max skill level on the site
 pub const MAX_PV_COUNT: usize = 96; // Safety cap for MultiPV candidate collection
 
-/// Infinite-chess strength limiting needs a much wider candidate set than Stockfish's
-/// fixed MultiPV=4. On a large board, the first several moves are often effectively
-/// equivalent, so picking one of four does not create a meaningful error.
+/// Strength limiting needs a wide candidate set here: on a large board the first
+/// several moves are often equivalent, so picking one of four is not a real error.
 #[derive(Clone, Copy, Debug)]
 struct SkillConfig {
     depth_cap: Option<usize>,
@@ -443,14 +442,6 @@ fn is_deep_only_tactic(result: &MultiPVResult, mv: Move, final_score: i32) -> bo
     deep_tactic_surprise_permille(result, mv, final_score) >= DEEP_TACTIC_SURPRISE_PERMILLE
 }
 
-#[cfg(feature = "nnue")]
-#[inline]
-fn static_position_eval(game: &GameState) -> i32 {
-    // No accumulator: this is a one-off read outside the search's NNUE stack.
-    evaluate(game, None)
-}
-
-#[cfg(not(feature = "nnue"))]
 #[inline]
 fn static_position_eval(game: &GameState) -> i32 {
     evaluate(game)
@@ -722,6 +713,8 @@ pub(crate) fn get_best_move_limited(
                 defense_scale: config.defense_eval_scale,
             }
         });
+        // After the style is installed, so a style change drops the other style's scores.
+        searcher.adopt_eval_kind(game.eval_kind);
 
         // For MultiPV, we use the same optimum/maximum but disable dynamic extensions
         searcher
@@ -751,7 +744,6 @@ pub(crate) fn get_best_move_limited(
                 effective_depth,
                 multi_pv,
                 silent,
-                None,
                 None,
                 None,
             );
@@ -897,13 +889,6 @@ mod tests {
         }
     }
 
-    /// Weak levels stop recognizing an attack, and over-value sitting still. The
-    /// scaling has to move a real position's score, not just exist.
-    #[cfg(feature = "nnue")]
-    fn eval_g(game: &GameState) -> i32 {
-        evaluate(game, None)
-    }
-    #[cfg(not(feature = "nnue"))]
     fn eval_g(game: &GameState) -> i32 {
         evaluate(game)
     }
@@ -1231,7 +1216,7 @@ mod tests {
         for config in SKILL_CONFIGS {
             let cap = config.depth_cap.unwrap();
             assert_eq!(
-                effective_skill_depth(&game, 64, config),
+                effective_skill_depth(&game, MAX_PLY, config),
                 cap + config.mop_up_depth_bonus
             );
         }

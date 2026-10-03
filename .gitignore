@@ -107,3 +107,33 @@ flake.lock
 .nnue-worktree/
 
 games/
+
+# Stage-A eval-net weights are embedded via include_bytes! and must be tracked.
+!src/eval_net/*.bin
+
+# Eval-net training byproducts: checkpoints, per-run logs, exported/fresh data.
+evalnet/checkpoints/
+evalnet/*.log
+evalnet/*.jsonl
+evalnet/lr/
+evalnet/screen/
+# Scratch benchmark binaries built for old/new comparisons.
+/*.exe
+evalnet/*.progress
+evalnet/*.hash
+evalnet/*.hashes
+evalnet/var/
+
+# Scratch output: root binaries, side build dirs, offline analysis dirs, local probes.
+/*.exe
+/target-*/
+evalnet/resid/
+evalnet/forensics/
+src/bin/sampler.rs
+evalnet/gen/
+evalnet/gn/
+evalnet/timeman/
+src/bin/check_probe.rs
+src/bin/collapse_probe.rs
+/puzzles_new*.csv*
+/puzzle_gen_*.log
