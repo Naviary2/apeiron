@@ -766,8 +766,9 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
     let mut b_pawn_bonus = 0;
     let mut w_pawn_penalty = 0;
     let mut b_pawn_penalty = 0;
-    let w_promo = game.white_promo_rank;
-    let b_promo = game.black_promo_rank;
+    // Each side's shortest pawn distance to the promotion rank ahead of it.
+    let mut w_promo_dist = i64::MAX;
+    let mut b_promo_dist = i64::MAX;
 
     // For multiplier_q
     let mut white_non_pawn_non_royal = 0;
@@ -1201,10 +1202,12 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                                 // 8. Pawn advancement, storm, and space metrics (unified pass)
                                 if pt == PieceType::Pawn {
                                     if is_white {
+                                        let w_promo = game.white_promo_rank_for(y);
                                         if y >= w_promo {
                                             w_pawn_penalty -= pawn_past_promo_penalty();
                                         } else {
                                             let dist = w_promo - y;
+                                            w_promo_dist = w_promo_dist.min(dist);
                                             let bonus =
                                                 (pawn_full_value_threshold() - dist.min(255) as i32) * 6;
 
@@ -1240,10 +1243,12 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                                             }
                                         }
                                     } else {
+                                        let b_promo = game.black_promo_rank_for(y);
                                         if y <= b_promo {
                                             b_pawn_penalty -= pawn_past_promo_penalty();
                                         } else {
                                             let dist = y - b_promo;
+                                            b_promo_dist = b_promo_dist.min(dist);
                                             let bonus =
                                                 (pawn_full_value_threshold() - dist.min(255) as i32) * 6;
 
@@ -1431,12 +1436,12 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
 
                         // Pawn Advancement Calculation
                         if white_max_y != i64::MIN {
-                            let dist = (w_promo - white_max_y).clamp(1, 100) as i32;
+                            let dist = w_promo_dist.clamp(1, 100) as i32;
                             // Continuous piecewise linear: matches 500 at dist=1, 350 at dist=2, then transitions to (10-dist)*40.
                             w_pawn_bonus += (500 - (dist - 1) * 150).max((10 - dist) * 40).max(0);
                         }
                         if black_min_y != i64::MAX {
-                            let dist = (black_min_y - b_promo).clamp(1, 100) as i32;
+                            let dist = b_promo_dist.clamp(1, 100) as i32;
                             b_pawn_bonus += (500 - (dist - 1) * 150).max((10 - dist) * 40).max(0);
                         }
 
@@ -1684,12 +1689,12 @@ pub fn evaluate_inner_traced<T: EvaluationTracer>(game: &GameState, tracer: &mut
                                 _ => 255,
                             };
                             let w_pd = if white_max_y != i64::MIN {
-                                (w_promo - white_max_y).clamp(1, 100) as i32
+                                w_promo_dist.clamp(1, 100) as i32
                             } else {
                                 100
                             };
                             let b_pd = if black_min_y != i64::MAX {
-                                (black_min_y - b_promo).clamp(1, 100) as i32
+                                b_promo_dist.clamp(1, 100) as i32
                             } else {
                                 100
                             };
@@ -3785,12 +3790,12 @@ fn hand_pawn_inputs<T: EvaluationTracer>(
     p.passer_min_dist = [
         w_passed
             .iter()
-            .map(|&(_, y)| (game.white_promo_rank - y).clamp(1, 100) as i32)
+            .map(|&(_, y)| (game.white_promo_rank_for(y) - y).clamp(1, 100) as i32)
             .min()
             .unwrap_or(100),
         b_passed
             .iter()
-            .map(|&(_, y)| (y - game.black_promo_rank).clamp(1, 100) as i32)
+            .map(|&(_, y)| (y - game.black_promo_rank_for(y)).clamp(1, 100) as i32)
             .min()
             .unwrap_or(100),
     ];
@@ -3895,7 +3900,7 @@ fn compute_pawn_core<T: EvaluationTracer>(
 
         // Relative rank 0 to 5 (assuming 6 ranks is "near promotion")
         // For an infinite board, we'll anchor to the promotion rank.
-        let w_promo = game.white_promo_rank;
+        let w_promo = game.white_promo_rank_for(wy);
         let dist_to_promo = w_promo.saturating_sub(wy).max(1);
         let rel_rank = (6 - dist_to_promo).clamp(0, 5) as usize;
 
@@ -4006,7 +4011,7 @@ fn compute_pawn_core<T: EvaluationTracer>(
             }
         }
 
-        let b_promo = game.black_promo_rank;
+        let b_promo = game.black_promo_rank_for(by);
         let dist_to_promo = by.saturating_sub(b_promo).max(1);
         let rel_rank = (6 - dist_to_promo).clamp(0, 5) as usize;
 
@@ -4139,7 +4144,12 @@ fn passer_is_unstoppable(
     defender: PlayerColor,
     defender_has_interceptor: bool,
 ) -> bool {
-    if moves_to_promo <= 0 || defender_has_interceptor {
+    // The path check stops short of the promotion square, and an obstacle, void or own
+    // piece standing on it has no reach below, yet a pawn can never push onto it.
+    if moves_to_promo <= 0
+        || defender_has_interceptor
+        || game.board.is_occupied(promo_sq.0, promo_sq.1)
+    {
         return false;
     }
     // A defender on move gets the extra tempo.
@@ -4185,7 +4195,7 @@ fn score_passed_pawns<T: EvaluationTracer>(
     let mut white_interceptor: Option<bool> = None;
 
     for &(wx, wy) in w_passed {
-        let w_promo = game.white_promo_rank;
+        let w_promo = game.white_promo_rank_for(wy);
         let dist_to_promo = w_promo.saturating_sub(wy).max(1);
         let rel_rank = (6 - dist_to_promo).clamp(0, 5) as usize;
 
@@ -4268,7 +4278,7 @@ fn score_passed_pawns<T: EvaluationTracer>(
     }
 
     for &(bx, by) in b_passed {
-        let b_promo = game.black_promo_rank;
+        let b_promo = game.black_promo_rank_for(by);
         let dist_to_promo = by.saturating_sub(b_promo).max(1);
         let rel_rank = (6 - dist_to_promo).clamp(0, 5) as usize;
 
@@ -4551,7 +4561,7 @@ pub fn evaluate_king_positioning_traced<T: EvaluationTracer>(
 
     // Find the closes distance from each pawn to the kings.
     for &(wx, wy) in white_pawns {
-        let w_promo = game.white_promo_rank;
+        let w_promo = game.white_promo_rank_for(wy);
         let dist_to_promo = w_promo.saturating_sub(wy).max(1);
         let rel_rank = (6 - dist_to_promo).clamp(0, 5) as usize;
         let mut min_d = 255; // Chebyshev distance
@@ -4616,7 +4626,7 @@ pub fn evaluate_king_positioning_traced<T: EvaluationTracer>(
         w_activity += (near_friendly_king_bonus - near_enemy_king_penalty) * weight / 3;
     }
     for &(bx, by) in black_pawns {
-        let b_promo = game.black_promo_rank;
+        let b_promo = game.black_promo_rank_for(by);
         let dist_to_promo = by.saturating_sub(b_promo).max(1);
         let rel_rank = (6 - dist_to_promo).clamp(0, 5) as usize;
         let mut min_d = 255; // Chebyshev distance
@@ -4753,6 +4763,19 @@ mod tests {
         let rays = king_rays_from_indices(&game.spatial_indices, king.x, king.y, PlayerColor::White).0;
         let pieces: Vec<_> = game.board.iter().collect();
         safe_check_units(&game, &king, PlayerColor::White, &rays, &pieces)
+    }
+
+    /// A pawn whose promotion square holds an obstacle can never push onto it, however
+    /// far away the defenders are.
+    #[test]
+    fn passer_is_not_unstoppable_onto_an_occupied_promotion_square() {
+        let unstoppable = |icn: &str| {
+            let mut game = GameState::new();
+            game.setup_position_from_icn(icn);
+            passer_is_unstoppable(&game, (5, 8), 1, PlayerColor::Black, false)
+        };
+        assert!(unstoppable("w (8;q|1;q) K1,1|k20,1|P5,7"));
+        assert!(!unstoppable("w (8;q|1;q) K1,1|k20,1|P5,7|ob5,8"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::moves::{
     Move, MoveList, SpatialIndices, get_pseudo_legal_moves, get_pseudo_legal_moves_into,
     get_pseudo_legal_moves_for_piece_into, is_square_attacked,
 };
-use crate::utils::{PRIMES_UNDER_128, is_prime_fast, is_prime_i64};
+use crate::utils::{is_prime_fast, is_prime_i64};
 use arrayvec::ArrayVec;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
@@ -161,6 +161,8 @@ pub struct UndoMove {
     pub old_black_royals: SmallVec<[Coordinate; 1]>,
     /// Old repetition value for restoration
     pub old_repetition: i32,
+    pub old_plies_since_rights_loss: u32,
+    pub old_clock_reset_had_ep: bool,
     /// Piece captured via en passant (could be a promoted piece, not just a pawn)
     pub ep_captured_piece: Option<Piece>,
     /// Incremental castling state for O(1) restoration
@@ -239,6 +241,10 @@ pub struct GameState {
     pub white_promo_rank: i64,
     #[serde(skip)]
     pub black_promo_rank: i64,
+    /// A side has several promotion ranks (custom ICN only), so a pawn's rank depends
+    /// on where it stands; see `white_promo_rank_for`.
+    #[serde(skip)]
+    pub multi_promo_ranks: bool,
     /// Cached royal positions for O(1) lookup. Updated incrementally in make/undo.
     #[serde(skip)]
     pub white_royals: SmallVec<[Coordinate; 1]>,
@@ -293,6 +299,14 @@ pub struct GameState {
     /// Search ply distance from last null move.
     #[serde(skip)]
     pub plies_from_null: u32,
+    /// Plies since a move removed a special right. As on the site, a lost right is one-way:
+    /// no position before it can repeat, even when the right no longer mattered for play.
+    #[serde(skip)]
+    pub plies_since_rights_loss: u32,
+    /// Whether the position the halfmove clock last reset at had an en passant square. The
+    /// site counts it, capturable or not, so no later position can repeat that one.
+    #[serde(skip)]
+    pub clock_reset_had_ep: bool,
 }
 
 // For backwards compatibility, keep castling_rights as an alias
@@ -364,6 +378,32 @@ impl GameState {
                     self.effective_castling_rights |= 1 << idx;
                 }
             }
+        }
+    }
+
+    /// The promotion rank a White pawn on rank `y` is heading for. One rank per side
+    /// (every preset) is a single flag test; several pick the next one ahead.
+    #[inline(always)]
+    pub fn white_promo_rank_for(&self, y: i64) -> i64 {
+        if self.multi_promo_ranks { self.next_promo_rank(true, y) } else { self.white_promo_rank }
+    }
+
+    /// As `white_promo_rank_for`, for a Black pawn on rank `y`.
+    #[inline(always)]
+    pub fn black_promo_rank_for(&self, y: i64) -> i64 {
+        if self.multi_promo_ranks { self.next_promo_rank(false, y) } else { self.black_promo_rank }
+    }
+
+    /// Nearest promotion rank ahead of a pawn on rank `y`; with none ahead, the side's
+    /// first rank, which the pawn is then past.
+    #[cold]
+    #[inline(never)]
+    fn next_promo_rank(&self, white: bool, y: i64) -> i64 {
+        let ranks = &self.game_rules.promotion_ranks;
+        if white {
+            ranks.white.iter().copied().filter(|&r| r > y).min().unwrap_or(self.white_promo_rank)
+        } else {
+            ranks.black.iter().copied().filter(|&r| r < y).max().unwrap_or(self.black_promo_rank)
         }
     }
 
@@ -459,6 +499,7 @@ impl GameState {
             black_back_rank: 8,
             white_promo_rank: i64::MIN,
             black_promo_rank: i64::MAX,
+            multi_promo_ranks: false,
             white_royals: SmallVec::new(),
             black_royals: SmallVec::new(),
             pawn_hash: 0,
@@ -473,6 +514,8 @@ impl GameState {
             pinned_black: rustc_hash::FxHashMap::default(),
             move_history: Vec::with_capacity(128),
             plies_from_null: 0,
+            plies_since_rights_loss: 0,
+            clock_reset_had_ep: false,
             total_phase: 0,
             initial_phase: 0,
             white_royal_bonus: 50,
@@ -510,6 +553,7 @@ impl GameState {
             black_back_rank: 8,
             white_promo_rank: 2_000_000_000_000_000,
             black_promo_rank: -2_000_000_000_000_000,
+            multi_promo_ranks: false,
             white_royals: SmallVec::new(),
             black_royals: SmallVec::new(),
             pawn_hash: 0,
@@ -524,6 +568,8 @@ impl GameState {
             pinned_black: rustc_hash::FxHashMap::default(),
             move_history: Vec::with_capacity(128),
             plies_from_null: 0,
+            plies_since_rights_loss: 0,
+            clock_reset_had_ep: false,
             total_phase: 0,
             initial_phase: 0,
             white_royal_bonus: 50,
@@ -923,6 +969,40 @@ impl GameState {
         true
     }
 
+    /// Blocks for an orthogonal slider standing on a Huygen's check line: the squares of
+    /// its reachable stretch that lie between king and checker at a prime distance from
+    /// the checker. Walking the stretch, not the primes under 128, keeps far blocks.
+    fn huygen_line_blocks(
+        &self,
+        from: Coordinate,
+        piece: Piece,
+        king: Coordinate,
+        checker: Coordinate,
+        step: (i64, i64),
+        out: &mut MoveList,
+    ) {
+        // Bounds a stretch with no piece beyond it; a real game never reaches it.
+        const MAX_WALK: i64 = 4096;
+        let cheb = |a: Coordinate, b: Coordinate| (a.x - b.x).abs().max((a.y - b.y).abs());
+        let check_dist = cheb(king, checker);
+        for dir in [step, (-step.0, -step.1)] {
+            let reach = match self.find_first_blocker_on_ray(from.x, from.y, dir.0, dir.1) {
+                Some((bx, by)) => {
+                    let b = cheb(from, Coordinate::new(bx, by));
+                    if self.board.is_occupied_by_color(bx, by, piece.color()) { b - 1 } else { b }
+                }
+                None => MAX_WALK,
+            };
+            for t in 1..=reach.min(MAX_WALK) {
+                let sq = Coordinate::new(from.x + dir.0 * t, from.y + dir.1 * t);
+                let (dk, dc) = (cheb(sq, king), cheb(sq, checker));
+                if dk > 0 && dc > 0 && dk + dc == check_dist && is_prime_fast(dc) {
+                    out.push(Move::new(from, sq, piece));
+                }
+            }
+        }
+    }
+
     /// Blocking squares for non-linear checkers (Rose). A single unblocked spiral
     /// path can be interrupted anywhere along it, but several paths must all be
     /// blocked at once, so the result is their intersection.
@@ -1224,6 +1304,22 @@ impl GameState {
         self.repetition != 0 && self.repetition < (ply as i32)
     }
 
+    /// How many plies back a position can still repeat: none before the last pawn move or
+    /// capture, special-right loss or null move, nor the clock-reset position if it had an
+    /// en passant square (the site's rules, which tell positions apart by both).
+    fn repetition_window(&self) -> usize {
+        let clock = self.halfmove_clock as usize;
+        let end = clock
+            .min(self.hash_stack.len())
+            .min(self.plies_from_null as usize)
+            .min(self.plies_since_rights_loss as usize);
+        if end == clock && self.clock_reset_had_ep {
+            end.saturating_sub(1)
+        } else {
+            end
+        }
+    }
+
     /// Whether some reversible move by the side to move recreates a position from the
     /// last `end` plies. An unbounded board has no cuckoo table, so the candidates are
     /// the reverses of our own recent moves, checked against the exact hash difference.
@@ -1233,10 +1329,7 @@ impl GameState {
 
         let stack_len = self.hash_stack.len();
         let history_len = self.move_history.len();
-        let end = (self.halfmove_clock as usize)
-            .min(self.plies_from_null as usize)
-            .min(stack_len)
-            .min(history_len);
+        let end = self.repetition_window().min(history_len);
         if end < 3 {
             return false;
         }
@@ -1279,7 +1372,9 @@ impl GameState {
                 // matches lie an even number of plies before it).
                 let mut j = hash_idx;
                 for _ in 0..4 {
-                    if j < 2 {
+                    // Past the repetition window (a lost right, an en passant position)
+                    // a matching hash is not the same position on the site.
+                    if j < 2 || stack_len - (j - 2) > end {
                         break;
                     }
                     j -= 2;
@@ -1709,22 +1804,19 @@ impl GameState {
             if pt.is_royal() {
                 // King moves: destination must not be attacked, or the mover's win
                 // condition must allow its king to be captured
-                use crate::moves::{is_square_attacked, knightrider_attacks_square_exact};
-                // The root list must be exact, so the capped rider walk inside
-                // is_square_attacked is backed up by an uncapped check here.
-                if (is_square_attacked(
+                use crate::moves::is_square_attacked;
+                if is_square_attacked(
                     &self.board,
                     &m.to,
                     self.turn.opponent(),
                     &self.spatial_indices,
-                ) || knightrider_attacks_square_exact(
-                    &self.board,
-                    &m.to,
-                    self.turn.opponent(),
-                    &self.spatial_indices,
-                )) && !self.king_capturable(self.turn)
+                ) && !self.king_capturable(self.turn)
                 {
                     illegal = true;
+                } else if m.partner_x != crate::moves::NO_PARTNER {
+                    // The partner still stands on the row it vacates, possibly shielding
+                    // the landing square from a rider beyond it: play the castle to see.
+                    strict = true;
                 }
             } else if rider_pins_possible || rose_pin_candidates.contains(&m.from) {
                 strict = true;
@@ -1807,6 +1899,11 @@ impl GameState {
                     &self.spatial_indices,
                 ) {
                     kings_in_check.push(pos);
+                    // Two checked royals already mean the general fallback below; the
+                    // fixed-size list must not overflow on positions with more.
+                    if kings_in_check.len() > 1 {
+                        break;
+                    }
                 }
             }
             if kings_in_check.is_empty() {
@@ -1886,20 +1983,10 @@ impl GameState {
 
         // 2. Capture checker or block attack (Only in single check)
         let checker_sq = checkers[0];
-        // A checker past any i64 distance, or a knightrider too many hops out to list
-        // its blocking squares, takes the exact move list instead: rare, and every
-        // evasion is verified after make anyway.
-        let far_check = match (
-            checker_sq.x.checked_sub(king_sq.x),
-            checker_sq.y.checked_sub(king_sq.y),
-        ) {
-            (Some(dx), Some(dy)) => {
-                dx.abs().max(dy.abs()) > 64
-                    && self.board.get_piece(checker_sq.x, checker_sq.y).map(|p| p.piece_type())
-                        == Some(PieceType::Knightrider)
-            }
-            _ => true,
-        };
+        // A checker past any i64 distance takes the exact move list instead: rare, and
+        // every evasion is verified after make anyway.
+        let far_check = checker_sq.x.checked_sub(king_sq.x).is_none()
+            || checker_sq.y.checked_sub(king_sq.y).is_none();
         if far_check {
             for (x, y, p) in self.board.iter_pieces_by_color(our_color == PlayerColor::White) {
                 if (x, y) != (king_sq.x, king_sq.y) && p.color() == our_color {
@@ -1933,15 +2020,9 @@ impl GameState {
 
         // A knightrider checks along repeated knight hops, so recover the hop
         // direction (ndx, ndy) and count n from king to checker; the blocking squares
-        // are king + i*(ndx, ndy) for i in 1..n.
-        let (
-            knightrider_blocking_squares,
-            knightrider_check_ndx,
-            knightrider_check_ndy,
-            knightrider_n,
-        ): (arrayvec::ArrayVec<Coordinate, 32>, i64, i64, i64) = if is_knightrider_checker {
+        // are king + i*(ndx, ndy) for i in 1..n, tested arithmetically at any range.
+        let (knightrider_check_ndx, knightrider_check_ndy, knightrider_n) = if is_knightrider_checker {
             use crate::attacks::KNIGHTRIDER_DIRS;
-            let mut blocking = arrayvec::ArrayVec::new();
             let mut found = (0i64, 0i64, 0i64);
             for &(ndx, ndy) in &KNIGHTRIDER_DIRS {
                 if ndx != 0 && ndy != 0 {
@@ -1949,17 +2030,25 @@ impl GameState {
                     let n_y = dy_check / ndy;
                     if n_x == n_y && n_x > 0 && dx_check == ndx * n_x && dy_check == ndy * n_y {
                         found = (ndx, ndy, n_x);
-                        for i in 1..n_x {
-                            blocking
-                                .push(Coordinate::new(king_sq.x + ndx * i, king_sq.y + ndy * i));
-                        }
                         break;
                     }
                 }
             }
-            (blocking, found.0, found.1, found.2)
+            found
         } else {
-            (arrayvec::ArrayVec::new(), 0, 0, 0)
+            (0, 0, 0)
+        };
+        // Called only for a knightrider checker, whose hop components are never 0.
+        let on_knightrider_path = |tx: i64, ty: i64| -> bool {
+            let (Some(ox), Some(oy)) = (tx.checked_sub(king_sq.x), ty.checked_sub(king_sq.y))
+            else {
+                return false;
+            };
+            let i = ox / knightrider_check_ndx;
+            ox % knightrider_check_ndx == 0
+                && i >= 1
+                && i < knightrider_n
+                && oy == knightrider_check_ndy * i
         };
 
         // For non-linear checkers, compute blocking squares up front
@@ -2096,10 +2185,7 @@ impl GameState {
             // For other checkers, use the standard check ray logic
             let is_valid_blocking_square = |tx: i64, ty: i64| -> bool {
                 if is_knightrider_checker {
-                    // For knightrider checkers, blocking squares are along the knight hop path
-                    knightrider_blocking_squares
-                        .iter()
-                        .any(|sq| sq.x == tx && sq.y == ty)
+                    on_knightrider_path(tx, ty)
                 } else {
                     // For other sliders, use standard check ray logic
                     s.is_on_check_ray(
@@ -2146,21 +2232,7 @@ impl GameState {
                             }
                         }
                     } else {
-                        // Slider IS on the check ray - iterate primes from checker to find blocking squares
-                        for &prime in &PRIMES_UNDER_128 {
-                            if prime >= check_dist {
-                                break;
-                            }
-                            // Blocking square is at prime distance from checker, toward king
-                            let tx = checker_sq.x - step_x * prime;
-                            let ty = king_sq.y;
-                            if tx == from.x {
-                                continue;
-                            }
-                            if s.is_path_clear_for_rook(&from, &Coordinate::new(tx, ty)) {
-                                out.push(Move::new(from, Coordinate::new(tx, ty), *piece));
-                            }
-                        }
+                        s.huygen_line_blocks(from, *piece, king_sq, checker_sq, (step_x, 0), out);
                     }
                 } else {
                     // Check ray is vertical at x = king_sq.x = checker_sq.x
@@ -2184,21 +2256,7 @@ impl GameState {
                             }
                         }
                     } else {
-                        // Slider IS on the check ray - iterate primes from checker to find blocking squares
-                        for &prime in &PRIMES_UNDER_128 {
-                            if prime >= check_dist {
-                                break;
-                            }
-                            // Blocking square is at prime distance from checker, toward king
-                            let tx = king_sq.x;
-                            let ty = checker_sq.y - step_y * prime;
-                            if ty == from.y {
-                                continue;
-                            }
-                            if s.is_path_clear_for_rook(&from, &Coordinate::new(tx, ty)) {
-                                out.push(Move::new(from, Coordinate::new(tx, ty), *piece));
-                            }
-                        }
+                        s.huygen_line_blocks(from, *piece, king_sq, checker_sq, (0, step_y), out);
                     }
                 }
             }
@@ -2544,13 +2602,9 @@ impl GameState {
                                 if t >= 1 && k >= 1 && k <= cn {
                                     let tx = from.x + t * ndx;
                                     let ty = from.y + t * ndy;
-                                    let mut path_clear = true;
-                                    for i in 1..t {
-                                        if s.board.is_occupied(from.x + i * ndx, from.y + i * ndy) {
-                                            path_clear = false;
-                                            break;
-                                        }
-                                    }
+                                    let path_clear = crate::moves::knightrider_path_clear(
+                                        &s.board, from.x, from.y, tx, ty,
+                                    );
                                     if path_clear && can_block_at(tx, ty) {
                                         out.push(Move::new(from, Coordinate::new(tx, ty), *piece));
                                     }
@@ -2575,13 +2629,9 @@ impl GameState {
                                 if t >= 1 && k >= 1 && k <= check_dist {
                                     let tx = from.x + t * ndx;
                                     let ty = from.y + t * ndy;
-                                    let mut path_clear = true;
-                                    for i in 1..t {
-                                        if s.board.is_occupied(from.x + i * ndx, from.y + i * ndy) {
-                                            path_clear = false;
-                                            break;
-                                        }
-                                    }
+                                    let path_clear = crate::moves::knightrider_path_clear(
+                                        &s.board, from.x, from.y, tx, ty,
+                                    );
                                     if path_clear
                                         && can_block_at(tx, ty)
                                         && (!is_huygen_checker || is_prime_fast(check_dist - k))
@@ -2820,11 +2870,7 @@ impl GameState {
                     continue;
                 }
                 // Blocking moves for knightrider checkers (for pieces not covered above)
-                if is_knightrider_checker
-                    && knightrider_blocking_squares
-                        .iter()
-                        .any(|sq| sq.x == m.to.x && sq.y == m.to.y)
-                {
+                if is_knightrider_checker && on_knightrider_path(m.to.x, m.to.y) {
                     out.push(m);
                     continue;
                 }
@@ -3160,6 +3206,8 @@ impl GameState {
             old_white_royals: self.white_royals.clone(),
             old_black_royals: self.black_royals.clone(),
             old_repetition: self.repetition,
+            old_plies_since_rights_loss: self.plies_since_rights_loss,
+            old_clock_reset_had_ep: self.clock_reset_had_ep,
             ep_captured_piece: None,
             old_effective_castling_rights: self.effective_castling_rights,
             old_castling_partner_counts: self.castling_partner_counts,
@@ -3495,14 +3543,19 @@ impl GameState {
             piece_type: piece.piece_type(),
         });
         self.plies_from_null += 1;
+        self.plies_since_rights_loss = if undo_info.special_rights_removed.is_empty() {
+            self.plies_since_rights_loss.saturating_add(1)
+        } else {
+            0
+        };
+        if self.halfmove_clock == 0 {
+            self.clock_reset_had_ep = self.en_passant.is_some();
+        }
 
         // Compute distance to previous occurrence for repetition detection:
         // of same position. 0 = no repetition, positive = distance to twofold, negative = threefold.
         self.repetition = 0;
-        // Positions before a null move are not reachable by real moves.
-        let end = (self.halfmove_clock as usize)
-            .min(self.hash_stack.len())
-            .min(self.plies_from_null as usize);
+        let end = self.repetition_window();
         if end >= 4 {
             let current_hash = self.hash;
             let mut i = 4usize;
@@ -3756,6 +3809,8 @@ impl GameState {
         self.black_royals = undo.old_black_royals;
         self.halfmove_clock = undo.old_halfmove_clock;
         self.repetition = undo.old_repetition;
+        self.plies_since_rights_loss = undo.old_plies_since_rights_loss;
+        self.clock_reset_had_ep = undo.old_clock_reset_had_ep;
         self.total_phase = undo.old_total_phase;
 
         // Restore castling state
@@ -3813,6 +3868,7 @@ impl GameState {
         self.game_rules.promotion_ranks.black.clear();
         self.white_promo_rank = i64::MIN;
         self.black_promo_rank = i64::MAX;
+        self.multi_promo_ranks = false;
 
         // An absent token means the default, not the previous position's value:
         // a retained royal count makes has_lost_by_royal_capture fire at once.
@@ -3864,6 +3920,8 @@ impl GameState {
         let tokens: Vec<&str> = content.split_whitespace().collect();
         let mut moves_to_play = Vec::new();
         let mut wc_list = Vec::new();
+        // `(white conditions|black conditions)` when the players' win conditions differ.
+        let mut player_wc: [Option<Vec<WinCondition>>; 2] = [None, None];
         let mut pieces_token = None;
 
         // Handle the case where it's just pieces
@@ -3904,6 +3962,14 @@ impl GameState {
                 if parts.len() > 1 {
                     self.game_rules.move_rule_limit = parts[1].parse::<u32>().ok();
                 }
+            } else if token.starts_with('(')
+                && token.ends_with(')')
+                && token[1..].starts_with(|c: char| c.is_ascii_alphabetic())
+            {
+                // Promotion rules open with a rank number, win conditions with a word.
+                for (idx, side) in token[1..token.len() - 1].split('|').take(2).enumerate() {
+                    player_wc[idx] = Some(side.split(',').filter_map(|w| w.parse().ok()).collect());
+                }
             } else if token.starts_with('(') && token.ends_with(')') {
                 // Promotion Rules: (w_rank;w_pieces|b_rank;b_pieces)
                 let inner = &token[1..token.len() - 1];
@@ -3916,24 +3982,17 @@ impl GameState {
                     if parts.is_empty() {
                         continue;
                     }
-                    // Parse promotion logic
-                    if let Ok(rank) = parts[0].parse::<i64>() {
+                    // Ranks are comma-separated, e.g. (8,17|1,10), and every one promotes.
+                    let ranks: Vec<i64> =
+                        parts[0].split(',').filter_map(|r| r.parse().ok()).collect();
+                    if let (Some(&lo), Some(&hi)) = (ranks.iter().min(), ranks.iter().max()) {
                         if idx == 0 {
-                            self.white_promo_rank = rank;
+                            self.white_promo_rank = lo;
+                            self.game_rules.promotion_ranks.white = ranks;
                         } else {
-                            self.black_promo_rank = rank;
+                            self.black_promo_rank = hi;
+                            self.game_rules.promotion_ranks.black = ranks;
                         }
-
-                        self.game_rules.promotion_ranks.white = if idx == 0 {
-                            vec![rank]
-                        } else {
-                            self.game_rules.promotion_ranks.white.clone()
-                        };
-                        self.game_rules.promotion_ranks.black = if idx != 0 {
-                            vec![rank]
-                        } else {
-                            self.game_rules.promotion_ranks.black.clone()
-                        };
                     }
 
                     if parts.len() > 1 {
@@ -4022,8 +4081,11 @@ impl GameState {
                 .unwrap_or(false)
         });
 
-        self.game_rules.white_win_condition = WinCondition::select(&wc_list, black_has_royal);
-        self.game_rules.black_win_condition = WinCondition::select(&wc_list, white_has_royal);
+        let [white_wc, black_wc] = &player_wc;
+        self.game_rules.white_win_condition =
+            WinCondition::select(white_wc.as_ref().unwrap_or(&wc_list), black_has_royal);
+        self.game_rules.black_win_condition =
+            WinCondition::select(black_wc.as_ref().unwrap_or(&wc_list), white_has_royal);
 
         self.finalize_setup();
 
@@ -4208,22 +4270,6 @@ impl GameState {
             self.black_back_rank = bk.y;
         }
 
-        // Sync optimized promotion rank fields with rule-based ones if they exist
-        if let Some(&r) = self.game_rules.promotion_ranks.white.first() {
-            self.white_promo_rank = r;
-        }
-        if let Some(&r) = self.game_rules.promotion_ranks.black.first() {
-            self.black_promo_rank = r;
-        }
-
-        // Validate promotion ranks against world bounds
-        if self.white_promo_rank < min_y || self.white_promo_rank > max_y {
-            self.white_promo_rank = i64::MIN;
-        }
-        if self.black_promo_rank < min_y || self.black_promo_rank > max_y {
-            self.black_promo_rank = i64::MAX;
-        }
-
         self.game_rules
             .promotion_ranks
             .white
@@ -4232,6 +4278,23 @@ impl GameState {
             .promotion_ranks
             .black
             .retain(|&r| r >= min_y && r <= max_y);
+        // The single cached rank is the first each side's pawns reach.
+        if let Some(&r) = self.game_rules.promotion_ranks.white.iter().min() {
+            self.white_promo_rank = r;
+        }
+        if let Some(&r) = self.game_rules.promotion_ranks.black.iter().max() {
+            self.black_promo_rank = r;
+        }
+        self.multi_promo_ranks = self.game_rules.promotion_ranks.white.len() > 1
+            || self.game_rules.promotion_ranks.black.len() > 1;
+
+        // Validate promotion ranks against world bounds
+        if self.white_promo_rank < min_y || self.white_promo_rank > max_y {
+            self.white_promo_rank = i64::MIN;
+        }
+        if self.black_promo_rank < min_y || self.black_promo_rank > max_y {
+            self.black_promo_rank = i64::MAX;
+        }
 
         // Cache starting non-pawn piece counts for phase detection
         self.init_starting_piece_counts();
@@ -4317,6 +4380,17 @@ mod tests {
                 .any(|m| m.from.x == 5 && m.from.y == 2 && m.to.x == 4 && m.to.y == 2),
             "royal-capture king must be allowed onto the attacked file"
         );
+    }
+
+    /// The site writes differing win conditions per player as `(white|black)`, which
+    /// must not be mistaken for the promotion-rules token.
+    #[test]
+    fn per_player_win_conditions_parse() {
+        let mut game = GameState::new();
+        game.setup_position_from_icn("w 0/100 1 (8|1) (royalcapture|checkmate) K5,1+|k5,8+|Q4,1");
+        assert_eq!(game.game_rules.white_win_condition, WinCondition::RoyalCapture);
+        assert_eq!(game.game_rules.black_win_condition, WinCondition::Checkmate);
+        assert_eq!(game.game_rules.promotion_ranks.white, vec![8]);
     }
 
     /// Pawn_Horde is asymmetric: Black has the only royal, so White wins by
@@ -4909,6 +4983,109 @@ mod tests {
         assert!(!game.is_repetition(1), "ply=1 < repetition=2, not a draw");
         assert!(!game.is_repetition(2), "ply=2 == repetition=2, not a draw");
         assert!(game.is_repetition(3), "ply=3 > repetition=2, is a draw");
+    }
+
+    /// A king losing its castling right ends the repetition window even though no castle
+    /// was possible, as on the site: the shuffle back home is a twofold, not a threefold.
+    #[test]
+    fn repetition_window_stops_at_a_lost_special_right() {
+        let mut game = GameState::new();
+        game.setup_position_from_icn("w 0/100 1 K5,1+|Q4,4|k5,8");
+        for _ in 0..2 {
+            game.make_move_coords(5, 1, 5, 2, None);
+            game.make_move_coords(5, 8, 5, 7, None);
+            game.make_move_coords(5, 2, 5, 1, None);
+            game.make_move_coords(5, 7, 5, 8, None);
+        }
+        assert_eq!(game.repetition, 4, "only the return after the lost right repeats");
+    }
+
+    /// The position right after a double push carries its en passant square, which the
+    /// site tells apart even when no pawn can take it.
+    #[test]
+    fn repetition_window_skips_an_en_passant_position() {
+        let mut game = GameState::new();
+        game.setup_position_from_icn("w 0/100 1 K5,1|N2,1|P1,2+|k5,8|n2,8");
+        game.make_move_coords(1, 2, 1, 4, None);
+        for _ in 0..2 {
+            game.make_move_coords(2, 8, 3, 6, None);
+            game.make_move_coords(2, 1, 3, 3, None);
+            game.make_move_coords(3, 6, 2, 8, None);
+            game.make_move_coords(3, 3, 2, 1, None);
+        }
+        assert_eq!(game.repetition, 4, "the en passant position is not counted");
+    }
+
+    /// A rook on a Huygen's check line blocks 137 squares from it, past the primes under
+    /// 128 the old scan tried, so the block was missing from the evasion list.
+    #[test]
+    fn rook_on_a_huygen_check_line_blocks_far_from_the_checker() {
+        let mut game = GameState::new();
+        game.setup_position_from_icn("w 0/100 1 K0,0|R0,1|P0,3|hu0,139|k50,50");
+        assert!(game.is_in_check());
+        let mut out = crate::moves::MoveList::new();
+        game.get_evasion_moves_into(&mut out);
+        assert!(out.iter().any(|m| (m.from.x, m.from.y, m.to.x, m.to.y) == (0, 1, 0, 2)));
+    }
+
+    /// Several promotion ranks per side all promote, and each pawn heads for the next
+    /// one ahead of it; only the base evaluator follows that.
+    #[test]
+    fn icn_parses_several_promotion_ranks() {
+        let mut game = GameState::new();
+        game.setup_position_from_icn("w 0/100 1 (8,17|1,-8) K5,1|k5,30|P3,16|p3,2");
+        assert_eq!(game.game_rules.promotion_ranks.white, vec![8, 17]);
+        assert_eq!(game.game_rules.promotion_ranks.black, vec![1, -8]);
+        assert_eq!((game.white_promo_rank, game.black_promo_rank), (8, 1));
+        assert!(game.multi_promo_ranks);
+        assert_eq!(game.white_promo_rank_for(3), 8);
+        assert_eq!(game.white_promo_rank_for(10), 17);
+        assert_eq!(game.white_promo_rank_for(20), 8, "past every rank");
+        assert_eq!(game.black_promo_rank_for(5), 1);
+        assert_eq!(game.black_promo_rank_for(0), -8);
+        assert_eq!(
+            crate::evaluation::eval_kind::detect(&game),
+            crate::evaluation::eval_kind::EvalKind::Generic
+        );
+        let moves = game.get_pseudo_legal_moves();
+        let promotes = |m: &&Move| (m.from.y, m.to.y) == (16, 17) && m.promotion.is_some();
+        assert!(moves.iter().any(|m| promotes(&m)));
+    }
+
+    /// A knightrider a billion hops from a far rook check still finds its block, by
+    /// testing the pieces on its line rather than walking every hop.
+    #[test]
+    fn knightrider_blocks_a_far_check_without_walking_the_hops() {
+        let mut game = GameState::new();
+        game.setup_position_from_icn("w 0/100 1 K0,0|NR0,1000000000|r1000000000000,0|k5,5");
+        let mut out = crate::moves::MoveList::new();
+        game.get_evasion_moves_into(&mut out);
+        assert!(out.iter().any(|m| (m.from.x, m.from.y, m.to.x, m.to.y)
+            == (0, 1_000_000_000, 2_000_000_000, 0)));
+    }
+
+    /// A knightrider checking from 40 hops away is still blocked exactly: the rook's
+    /// interposition on its path must be in the evasion list.
+    #[test]
+    fn far_knightrider_check_keeps_slider_blocks() {
+        let mut game = GameState::new();
+        game.setup_position_from_icn("w 0/100 1 K0,0|R10,-5|nr40,80|k50,50");
+        let mut out = crate::moves::MoveList::new();
+        game.get_evasion_moves_into(&mut out);
+        assert!(
+            out.iter().any(|m| (m.from.x, m.from.y, m.to.x, m.to.y) == (10, -5, 10, 20)),
+            "rook block on the knightrider's 10th hop is missing"
+        );
+    }
+
+    /// The exact root list holds a knightrider's quiet check past its hop window, as the
+    /// interior quiet stage does.
+    #[test]
+    fn root_list_has_far_knightrider_quiet_checks() {
+        let mut game = GameState::new();
+        game.setup_position_from_icn("w 0/100 1 NR0,0|K-20,-20|k14,25");
+        let moves = game.get_pseudo_legal_moves();
+        assert!(moves.iter().any(|m| (m.from.x, m.from.y, m.to.x, m.to.y) == (0, 0, 12, 24)));
     }
 
     #[test]

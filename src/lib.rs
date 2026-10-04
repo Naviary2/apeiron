@@ -783,8 +783,8 @@ impl Engine {
 
         #[cfg(target_arch = "wasm32")]
         {
-            let pre_stats = crate::search::get_current_tt_stats();
             if !silent {
+                let pre_stats = crate::search::get_current_tt_stats();
                 use crate::log;
                 let variant = self
                     .game
@@ -972,24 +972,36 @@ impl Engine {
         // worker's JS yields, and retire only when the epoch bumps.
         #[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
         {
-            // Helpers = pool size - 1; the page sizes the pool, so no engine-side cap.
-            let num_threads = rayon::current_num_threads().max(1);
+            // Helpers = pool size - 1, within the wasm memory budget.
+            let num_threads = search::wasm_search_threads();
             if num_threads > 1 {
                 search::init_shared_tt();
                 search::USE_SHARED_TT.store(true, std::sync::atomic::Ordering::Relaxed);
 
-                // New position, or a resume with no batch alive (e.g. "go deeper" after the
-                // helpers retired at done): retire any previous batch, launch a fresh one.
+                // New position, a resume with no batch alive (e.g. "go deeper" after the helpers
+                // retired at done), or a new MultiPV count: retire any previous batch, launch a
+                // fresh one. Helpers have no depth limit, as in Stockfish: one that stopped at
+                // the target would idle through the main thread's last and longest depth.
+                let settings = (search::MAX_PLY, multi_pv);
+                let respawn = {
+                    let mut live =
+                        search::HELPER_SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+                    let changed = *live != settings;
+                    *live = settings;
+                    changed
+                };
                 if start_depth <= 1
                     || search::HELPERS_LIVE.load(std::sync::atomic::Ordering::Relaxed) == 0
+                    || respawn
                 {
+                    search::adopt_main_eval_kind(&self.game, slice_ms);
                     let epoch =
                         search::HELPER_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     search::GLOBAL_STOP.store(false, std::sync::atomic::Ordering::Relaxed);
                     for i in 1..num_threads {
                         let game_clone = self.game.clone();
                         rayon::spawn(move || {
-                            search::helper_run(game_clone, epoch, i, max_depth, multi_pv)
+                            search::helper_run(game_clone, epoch, i, search::MAX_PLY, multi_pv)
                         });
                     }
                 }
